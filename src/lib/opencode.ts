@@ -69,33 +69,6 @@ function extractOpenCodeText(parts: OpenCodeMessagePart[] | undefined) {
     .join("\n\n");
 }
 
-function extractTextDeep(value: unknown, depth = 0): string {
-  if (value == null || depth > 4) return "";
-  if (typeof value === "string") return value.trim();
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => extractTextDeep(item, depth + 1))
-      .filter(Boolean)
-      .join("\n\n")
-      .trim();
-  }
-  if (typeof value !== "object") return "";
-
-  const obj = value as Record<string, unknown>;
-  const directKeys = ["text", "content", "summary", "output_text", "result"];
-  const direct = directKeys
-    .map((key) => (typeof obj[key] === "string" ? String(obj[key]).trim() : ""))
-    .filter(Boolean)
-    .join("\n\n");
-  if (direct) return direct;
-
-  return Object.values(obj)
-    .map((item) => extractTextDeep(item, depth + 1))
-    .filter(Boolean)
-    .join("\n\n")
-    .trim();
-}
-
 export async function getOpenCodeHealth() {
   const baseUrl = getOpenCodeBaseUrl();
 
@@ -150,6 +123,7 @@ export async function promptOpenCodeSession(
   prompt: string,
   system?: string,
   timeoutOverrideMs?: number,
+  maxTokens?: number,
 ) {
   const baseUrl = getOpenCodeBaseUrl();
 
@@ -164,6 +138,7 @@ export async function promptOpenCodeSession(
       headers: getOpenCodeHeaders(),
       body: JSON.stringify({
         system,
+        max_tokens: maxTokens,
         parts: [{ type: "text", text: prompt }],
       }),
     },
@@ -180,7 +155,16 @@ export async function promptOpenCodeSession(
   const content =
     extractOpenCodeText(payload.parts) ||
     extractOpenCodeText(payload.message?.parts) ||
-    extractTextDeep(payload);
+    (typeof payload.message?.content === "string" ? payload.message.content.trim() : "") ||
+    (typeof payload.content === "string" ? payload.content.trim() : "") ||
+    (typeof payload.text === "string" ? payload.text.trim() : "") ||
+    (typeof payload.summary === "string" ? payload.summary.trim() : "");
+
+  // OpenCode can sometimes surface upstream provider failures as plain text.
+  // Do not treat those as valid assistant output.
+  if (/APIError|\"error\"\s*:\s*\{\s*\"message\"/i.test(content)) {
+    throw new Error(`OpenCode upstream error: ${content.slice(0, 500)}`);
+  }
 
   if (!content) {
     throw new Error("OpenCode returned no assistant text");

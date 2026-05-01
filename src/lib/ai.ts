@@ -68,7 +68,7 @@ function isCodingProjectRequest(prompt: string) {
 }
 
 const BASE_AGENT_SYSTEM =
-  "You are an agent inside PineApple. Be concise, action-oriented, and do not claim that high-risk actions were executed unless an explicit approval flow has already completed. IMPORTANT: Do NOT include any hidden reasoning, 'thinking', or analysis. Output only the final answer.";
+  "You are an agent inside PineApple. Be concise, action-oriented, and do not claim that high-risk actions were executed unless an explicit approval flow has already completed. IMPORTANT: Do NOT include any hidden reasoning, 'thinking', or analysis. Do not call tools. Output only the final answer.";
 
 const PROJECT_ARTIFACT_SYSTEM = [
   "When the user asks you to build, code, create, or generate a website, app, landing page, dashboard, ecommerce store, or similar project, return a complete preview-ready project artifact.",
@@ -335,8 +335,19 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
   }
 
   if (input.opencodeSessionId && process.env.OPENCODE_SERVER_URL) {
-    async function callOpenCode(prompt: string, systemPrompt: string, timeoutMs?: number) {
-      return promptOpenCodeSession(input.opencodeSessionId!, prompt, systemPrompt, timeoutMs);
+    async function callOpenCode(
+      prompt: string,
+      systemPrompt: string,
+      timeoutMs?: number,
+      maxTokens?: number,
+    ) {
+      return promptOpenCodeSession(
+        input.opencodeSessionId!,
+        prompt,
+        systemPrompt,
+        timeoutMs,
+        maxTokens,
+      );
     }
 
     try {
@@ -345,6 +356,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         input.prompt,
         baseSystem,
         codingProjectRequest ? 180_000 : 120_000,
+        codingProjectRequest ? 3000 : 1024,
       );
 
       if (!openCodeResult?.content?.trim()) {
@@ -352,6 +364,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
           input.prompt,
           `${baseSystem}\n\nReturn plain text response only. Do not emit empty parts.`,
           codingProjectRequest ? 180_000 : 120_000,
+          codingProjectRequest ? 2200 : 900,
         );
       }
 
@@ -364,7 +377,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
           "3) valid JSON only inside that block with: {\"name\",\"entry\",\"files\":[{\"path\",\"content\"}]}",
           "Do not include any other text.",
         ].join("\n");
-        openCodeResult = await callOpenCode(repairPrompt, baseSystem, 150_000);
+        openCodeResult = await callOpenCode(repairPrompt, baseSystem, 150_000, 1800);
       }
 
       if (openCodeResult) {
