@@ -1,0 +1,271 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String               @id @default(cuid())
+  email           String               @unique
+  googleId        String?              @unique
+  name            String
+  passwordHash    String
+  role            String               @default("USER")
+  status          String               @default("ACTIVE")
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  sessions        Session[]
+  wallet          TokenWallet?
+  subscriptions   Subscription[]
+  agents          UserAgent[]
+  conversations   Conversation[]
+  messages        Message[]
+  tasks           AgentTask[]
+  approvals       ApprovalRequest[]
+  notifications   Notification[]
+  transactions    PaymentTransaction[]
+  logs            SystemLog[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Plan {
+  id              String         @id @default(cuid())
+  code            String         @unique
+  name            String
+  tagline         String?
+  description     String?
+  monthlyPriceInr Int
+  monthlyTokens   Int
+  maxAgents       Int
+  isCustom        Boolean        @default(false)
+  isActive        Boolean        @default(true)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+  subscriptions   Subscription[]
+}
+
+model Subscription {
+  id                 String   @id @default(cuid())
+  userId             String
+  planId             String
+  status             String   @default("ACTIVE")
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan               Plan     @relation(fields: [planId], references: [id])
+
+  @@index([userId])
+  @@index([planId])
+  @@index([status])
+}
+
+model TokenWallet {
+  id                          String   @id @default(cuid())
+  userId                      String   @unique
+  subscriptionTokensRemaining Int      @default(0)
+  purchasedTokensRemaining    Int      @default(0)
+  resetAt                     DateTime
+  updatedAt                   DateTime @updatedAt
+  user                        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model TokenLedger {
+  id        String   @id @default(cuid())
+  userId    String
+  amount    Int
+  type      String
+  source    String
+  reason    String
+  metadata  String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([type])
+}
+
+model Agent {
+  id             String      @id @default(cuid())
+  slug           String      @unique
+  name           String
+  category       String
+  description    String
+  riskLevel      String      @default("LOW")
+  isDefault      Boolean     @default(false)
+  isActive       Boolean     @default(true)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  users          UserAgent[]
+  conversations  Conversation[]
+  tasks          AgentTask[]
+}
+
+model UserAgent {
+  id         String    @id @default(cuid())
+  userId     String
+  agentId    String
+  status     String    @default("SELECTED")
+  deployedAt DateTime?
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent      Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, agentId])
+  @@index([status])
+}
+
+model Conversation {
+  id                String      @id @default(cuid())
+  userId            String
+  agentId           String?
+  title             String
+  opencodeSessionId String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent             Agent?      @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  messages          Message[]
+  tasks             AgentTask[]
+
+  @@index([userId])
+  @@index([agentId])
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  userId         String
+  conversationId String
+  role           String
+  content        String
+  tokenEstimate  Int          @default(0)
+  createdAt      DateTime     @default(now())
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId])
+  @@index([userId])
+}
+
+model AgentTask {
+  id             String           @id @default(cuid())
+  userId         String
+  agentId        String?
+  conversationId String?
+  prompt         String
+  status         String           @default("QUEUED")
+  actionType     String           @default("NORMAL")
+  riskLevel      String           @default("LOW")
+  result         String?
+  tokenCost      Int              @default(0)
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent          Agent?           @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  conversation   Conversation?    @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  approval       ApprovalRequest?
+  logs           SystemLog[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([conversationId])
+}
+
+model ApprovalRequest {
+  id        String    @id @default(cuid())
+  taskId    String    @unique
+  userId    String
+  actionType String
+  payload   String
+  status    String    @default("PENDING")
+  decidedAt DateTime?
+  createdAt DateTime  @default(now())
+  task      AgentTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  body      String
+  surface   String    @default("global")
+  kind      String    @default("info")
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([readAt])
+  @@index([surface])
+}
+
+model PaymentTransaction {
+  id               String   @id @default(cuid())
+  userId           String
+  razorpayOrderId  String?
+  razorpayPaymentId String?
+  amountInr        Int
+  currency         String   @default("INR")
+  kind             String
+  status           String   @default("CREATED")
+  metadata         String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}
+
+model TokenPack {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  name      String
+  tokens    Int
+  priceInr  Int
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model SystemLog {
+  id        String     @id @default(cuid())
+  userId    String?
+  taskId    String?
+  level     String     @default("INFO")
+  event     String
+  summary   String
+  metadata  String?
+  createdAt DateTime   @default(now())
+  user      User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  task      AgentTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([taskId])
+  @@index([level])
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}

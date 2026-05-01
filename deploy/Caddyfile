@@ -1,0 +1,28 @@
+{
+  email admin@pineapplee.com
+}
+
+pineapplee.com, www.pineapplee.com, chat.pineapplee.com, admin.pineapplee.com {
+  encode zstd gzip
+
+  @health path /api/health
+  handle @health {
+    reverse_proxy app:3000
+  }
+
+  handle {
+    reverse_proxy app:3000 {
+      header_up X-Real-IP {remote_host}
+      header_up X-Forwarded-For {remote_host}
+      header_up X-Forwarded-Proto {scheme}
+    }
+  }
+
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    -Server
+  }
+}

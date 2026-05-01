@@ -1,0 +1,10 @@
+.git
+.gitignore
+.next
+.venv
+node_modules
+npm-debug.log*
+docs
+prisma/dev.db
+README.md
+tsconfig.tsbuildinfo
