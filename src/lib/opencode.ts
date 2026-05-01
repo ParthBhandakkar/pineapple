@@ -13,6 +13,14 @@ type OpenCodeMessageResponse = {
   info?: {
     modelID?: string;
     providerID?: string;
+    error?: {
+      name?: string;
+      data?: {
+        message?: string;
+        statusCode?: number;
+        responseBody?: string;
+      };
+    };
   };
   parts?: OpenCodeMessagePart[];
   message?: {
@@ -124,6 +132,7 @@ export async function promptOpenCodeSession(
   system?: string,
   timeoutOverrideMs?: number,
   maxTokens?: number,
+  model?: { providerID: string; modelID: string },
 ) {
   const baseUrl = getOpenCodeBaseUrl();
 
@@ -139,6 +148,7 @@ export async function promptOpenCodeSession(
       body: JSON.stringify({
         system,
         max_tokens: maxTokens,
+        model,
         parts: [{ type: "text", text: prompt }],
       }),
     },
@@ -151,6 +161,14 @@ export async function promptOpenCodeSession(
   }
 
   const payload = (await response.json()) as OpenCodeMessageResponse;
+
+  const providerErrorMessage = payload.info?.error?.data?.message?.trim();
+  if (providerErrorMessage) {
+    const providerErrorCode = payload.info?.error?.data?.statusCode;
+    throw new Error(
+      `OpenCode upstream provider error${providerErrorCode ? ` (${providerErrorCode})` : ""}: ${providerErrorMessage}`,
+    );
+  }
 
   const content =
     extractOpenCodeText(payload.parts) ||

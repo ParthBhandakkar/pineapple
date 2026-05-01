@@ -10,9 +10,20 @@ type ExecuteTaskInput = {
   taskId: string;
   approved?: boolean;
   billingModelCode?: string | null;
+  retryCount?: number;
 };
 
+const MAX_TRANSIENT_RETRIES = 4;
+
+function isTransientGenerationError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "AbortError") return true;
+  const msg = error.message.toLowerCase();
+  return msg.includes("timed out") || msg.includes("timeout") || msg.includes("fetch failed") || msg.includes("network");
+}
+
 export async function executeTask(input: ExecuteTaskInput) {
+  const retryCount = input.retryCount ?? 0;
   const task = await prisma.agentTask.findUniqueOrThrow({
     where: { id: input.taskId },
     include: {
@@ -80,6 +91,31 @@ export async function executeTask(input: ExecuteTaskInput) {
     });
   } catch (error) {
     logError("Model generation failed", error, { taskId: task.id, userId: task.userId });
+
+    if (isTransientGenerationError(error) && retryCount < MAX_TRANSIENT_RETRIES) {
+      const delayMs = Math.min(20_000, 4_000 * (retryCount + 1));
+      await prisma.agentTask.update({
+        where: { id: task.id },
+        data: {
+          status: "QUEUED",
+          result: "Waiting for model response...",
+        },
+      });
+      setTimeout(() => {
+        void executeTask({
+          ...input,
+          retryCount: retryCount + 1,
+        }).catch((retryError) => {
+          logError("Background retry execution failed", retryError, {
+            taskId: task.id,
+            userId: task.userId,
+            retryCount: retryCount + 1,
+          });
+        });
+      }, delayMs);
+      return task;
+    }
+
     const message =
       error instanceof Error && error.name === "AbortError"
         ? "The model request timed out. Try again, or set MODEL_REQUEST_TIMEOUT_MS higher on the server."

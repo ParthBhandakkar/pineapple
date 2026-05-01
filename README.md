@@ -30,6 +30,8 @@ npm run build
 npm audit --audit-level=moderate
 ```
 
+`/api/health` now returns `503` when core dependencies are degraded and includes `modelProvider` status so invalid OpenRouter credentials are visible immediately.
+
 The local and production stack now uses PostgreSQL through Prisma Client. `docker-compose.yml` starts PostgreSQL, Redis, OpenCode, the Next.js app, and Caddy for the production VM deployment. For local development outside Docker, the sample `.env` values target `127.0.0.1` so `docker compose up -d postgres redis opencode` is enough to back `npm run dev`.
 
 ## Environment
@@ -70,5 +72,7 @@ Set `COOKIE_SECURE="true"` when serving behind HTTPS.
 
 - Provision real OpenRouter credentials so OpenCode and direct chat calls can return live model output.
 - Add real OpenRouter and Razorpay credentials.
+- Keep production secrets out of git (store them in an untracked `.env.production` on the VM or your secret manager).
 - Put the app behind HTTPS and set `COOKIE_SECURE="true"`.
+- If `FORCE_OPENCODE_ONLY="true"`, the health endpoint requires both database + OpenCode to be healthy.
 - Add container/workspace isolation if the shared VM starts executing untrusted code, not just orchestrating sessions.

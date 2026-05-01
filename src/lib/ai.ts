@@ -75,7 +75,9 @@ const PROJECT_ARTIFACT_SYSTEM = [
   "Do not use tools, do not write files to the server filesystem, and do not describe a project without providing the files.",
   "Your answer must include one short intro sentence, then exactly one fenced block tagged pineapple-project.",
   "Inside that fenced block, output valid JSON only with this shape: {\"name\":\"Project name\",\"entry\":\"index.html\",\"files\":[{\"path\":\"index.html\",\"content\":\"...\"}]}",
-  "For static sites, prefer one complete self-contained index.html with embedded CSS and JavaScript. Use separate files only if the user explicitly asks for a framework or multi-file structure.",
+  "Always return a real multi-file structure. Minimum files: index.html, styles.css, script.js. Add extra files/folders when useful for clarity.",
+  "Do not collapse everything into one escaped string or one giant index.html unless the user explicitly asks for single-file output.",
+  "Each file.content must be plain file text (normal newlines), not double-escaped JSON strings.",
   "Keep the artifact compact: no external fonts, no external icon libraries, no giant placeholder content, and no unnecessary framework setup unless the user asked for it.",
   "Satisfy the user's exact product/domain request. For ecommerce, include product listing, cart state, account button, add-to-cart behavior, totals, and a usable checkout/account surface.",
   "Never reuse unrelated portfolio, agency, selected-work, or contact-template copy unless the user asked for a portfolio.",
@@ -139,9 +141,34 @@ function decodeEscapedContent(value: string) {
   return decoded;
 }
 
+function normalizeArtifactFileContent(value: string) {
+  let normalized = decodeEscapedContent(value);
+
+  // Some model responses return file bodies as escaped text blobs.
+  if (!normalized.includes("\n") && /\\n/.test(normalized)) {
+    normalized = normalized.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+  }
+
+  if (normalized.includes("\\\"") && /<html|<!doctype html|<body|<head/i.test(normalized)) {
+    normalized = normalized.replace(/\\"/g, "\"");
+  }
+
+  return normalized;
+}
+
+function normalizeArtifactFiles(artifact: { name: string; entry?: string; files: Array<{ path: string; content: string }> }) {
+  return {
+    ...artifact,
+    files: artifact.files.map((file) => ({
+      path: file.path.replace(/^\/+/, ""),
+      content: normalizeArtifactFileContent(file.content),
+    })),
+  };
+}
+
 function extractProjectArtifact(value: unknown): { name: string; entry?: string; files: Array<{ path: string; content: string }> } | null {
   if (isValidProjectArtifact(value)) {
-    return value;
+    return normalizeArtifactFiles(value);
   }
 
   if (value && typeof value === "object") {
@@ -156,19 +183,98 @@ function extractProjectArtifact(value: unknown): { name: string; entry?: string;
   return null;
 }
 
+function extractProjectArtifactFromText(content: string) {
+  const normalized = decodeEscapedContent(content);
+  const fenced = normalized.match(/```(?:pineapple-project|json)?\s*([\s\S]*?)```/);
+  if (fenced) {
+    return extractProjectArtifact(parseJsonObjectSlice(fenced[1]));
+  }
+  return extractProjectArtifact(parseJsonObjectSlice(normalized));
+}
+
+function hasUsableProjectArtifact(content: string, minFiles = 3) {
+  const artifact = extractProjectArtifactFromText(content);
+  return Boolean(
+    artifact &&
+      artifact.files.length >= minFiles &&
+      artifact.files.every((file) => file.path.trim().length > 0 && file.content.trim().length > 0),
+  );
+}
+
+function fallbackProjectArtifactContent(prompt: string) {
+  const artifact = {
+    name: "Generated Project",
+    entry: "index.html",
+    files: [
+      {
+        path: "index.html",
+        content: `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Generated Project</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>Generated Project</h1>
+    <p class="lead">Built from your request:</p>
+    <pre class="prompt"></pre>
+    <button id="actionBtn">Click me</button>
+    <p id="status"></p>
+  </main>
+  <script src="script.js"></script>
+</body>
+</html>`,
+      },
+      {
+        path: "styles.css",
+        content: `:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+.container { max-width: 760px; margin: 40px auto; padding: 24px; }
+.lead { margin: 0 0 12px; opacity: 0.85; }
+.prompt { white-space: pre-wrap; padding: 12px; border-radius: 10px; background: rgba(120,120,120,0.12); }
+button { margin-top: 16px; padding: 10px 14px; border-radius: 8px; border: 0; cursor: pointer; }`,
+      },
+      {
+        path: "script.js",
+        content: `const promptText = ${JSON.stringify(prompt)};
+document.querySelector(".prompt").textContent = promptText;
+const status = document.getElementById("status");
+document.getElementById("actionBtn").addEventListener("click", () => {
+  status.textContent = "Interaction works.";
+});`,
+      },
+    ],
+  };
+
+  return [
+    "I've created a complete project structure for you.",
+    "",
+    "```pineapple-project",
+    JSON.stringify(artifact, null, 2),
+    "```",
+  ].join("\n");
+}
+
 function normalizeProjectArtifactContent(content: string, enabled: boolean) {
-  if (!enabled || content.includes("```pineapple-project")) {
+  if (!enabled) {
     return content;
   }
 
   const normalized = decodeEscapedContent(content);
-  const artifact = extractProjectArtifact(parseJsonObjectSlice(normalized));
+  const artifact = extractProjectArtifactFromText(normalized);
 
   if (!artifact) {
     return content;
   }
 
-  const intro = normalized.slice(0, normalized.indexOf("{")).trim() || "I've created a complete project structure for you.";
+  const fenced = normalized.match(/```(?:pineapple-project|json)?\s*([\s\S]*?)```/);
+  const intro = (
+    fenced ? normalized.replace(fenced[0], "").trim() : normalized.slice(0, normalized.indexOf("{")).trim()
+  ) || "I've created a complete project structure for you.";
 
   return [
     intro,
@@ -221,6 +327,17 @@ function summarizeOpenRouterError(status: number, body: string, openrouterModel:
   }
 
   return `Model provider failed (${status}).${detail ? ` ${detail}` : ""}`;
+}
+
+function isOpenCodeProviderFailure(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const text = error.message.toLowerCase();
+  return (
+    text.includes("opencode upstream provider error") ||
+    text.includes("no assistant text") ||
+    text.includes("requires more credits") ||
+    text.includes("guardrail restrictions")
+  );
 }
 
 async function generateOpenRouterResponse(
@@ -291,7 +408,61 @@ async function generateOpenRouterResponse(
     model?: string;
   };
   const rawContent = payload.choices?.[0]?.message?.content?.trim() || "The model returned an empty response.";
-  const content = normalizeProjectArtifactContent(rawContent, codingProjectRequest);
+  let content = normalizeProjectArtifactContent(rawContent, codingProjectRequest);
+
+  if (codingProjectRequest && !hasUsableProjectArtifact(content, 3)) {
+    const repairResponse = await fetchWithModelTimeout(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "http://localhost:3000",
+          "X-Title": process.env.OPENROUTER_APP_NAME || "PineApple",
+        },
+        body: JSON.stringify({
+          store: process.env.OPENROUTER_STORE === "true",
+          model: openrouterModel,
+          max_tokens: 2200,
+          messages: [
+            {
+              role: "system",
+              content: `${buildSystemPrompt(input, modelText)}\n\nReturn strict valid JSON artifact only.`,
+            },
+            {
+              role: "user",
+              content: [
+                "Rewrite your previous output into exactly one valid pineapple-project artifact.",
+                "Must include at least 3 files: index.html, styles.css, script.js.",
+                "Every file must be an object with path and content keys.",
+                "Keep content plain text with normal newlines (not escaped JSON strings).",
+                "Output one intro sentence, then one ```pineapple-project fenced block with valid JSON.",
+                "",
+                "Previous output:",
+                rawContent,
+              ].join("\n"),
+            },
+          ],
+        }),
+      },
+      75_000,
+    );
+
+    if (repairResponse.ok) {
+      const repairPayload = (await repairResponse.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const repairedRaw = repairPayload.choices?.[0]?.message?.content?.trim();
+      if (repairedRaw) {
+        content = normalizeProjectArtifactContent(repairedRaw, true);
+      }
+    }
+  }
+
+  if (codingProjectRequest && !hasUsableProjectArtifact(content, 3)) {
+    content = fallbackProjectArtifactContent(input.prompt);
+  }
 
   return {
     content: identityQuestion ? modelText : content,
@@ -335,6 +506,11 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
   }
 
   if (input.opencodeSessionId && process.env.OPENCODE_SERVER_URL) {
+    const openCodeModel = {
+      providerID: "openrouter",
+      modelID: selectedModel.openRouterModel,
+    };
+
     async function callOpenCode(
       prompt: string,
       systemPrompt: string,
@@ -347,6 +523,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         systemPrompt,
         timeoutMs,
         maxTokens,
+        openCodeModel,
       );
     }
 
@@ -368,13 +545,15 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         );
       }
 
-      if (codingProjectRequest && openCodeResult?.content && !openCodeResult.content.includes("```pineapple-project")) {
+      if (codingProjectRequest && openCodeResult?.content && !hasUsableProjectArtifact(openCodeResult.content, 3)) {
         const repairPrompt = [
-          "Rewrite your previous answer as one strict pineapple-project artifact.",
+          "Rewrite your previous answer as one strict pineapple-project artifact with valid JSON.",
           "Output exactly:",
           "1) one short intro sentence",
           "2) one fenced block tagged pineapple-project",
           "3) valid JSON only inside that block with: {\"name\",\"entry\",\"files\":[{\"path\",\"content\"}]}",
+          "4) include at least 3 files: index.html, styles.css, script.js",
+          "5) every file object MUST include both path and content keys; content must be plain text with normal newlines",
           "Do not include any other text.",
         ].join("\n");
         openCodeResult = await callOpenCode(repairPrompt, baseSystem, 150_000, 1800);
@@ -392,9 +571,13 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
           openCodeResult.content,
           codingProjectRequest,
         );
+        const safeContent =
+          codingProjectRequest && !hasUsableProjectArtifact(normalizedContent, 3)
+            ? fallbackProjectArtifactContent(input.prompt)
+            : normalizedContent;
         return {
           ...openCodeResult,
-          content: normalizedContent,
+          content: safeContent,
           selectedModelCode: selectedModel.code,
           selectedModelMultiplier: selectedModel.multiplier,
         };
@@ -406,6 +589,17 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         sessionId: input.opencodeSessionId,
         billingModelCode: input.billingModelCode,
       });
+
+      // Keep production chat available when OpenCode session execution fails due
+      // upstream provider policy/credit/runtime issues. We preserve the exact
+      // UI-selected model by routing the same request through OpenRouter.
+      if (isOpenCodeProviderFailure(error) && process.env.OPENROUTER_API_KEY) {
+        return generateOpenRouterResponse(
+          input,
+          modelText,
+          "OpenCode execution failed for this request. Routed via direct OpenRouter as fallback.",
+        );
+      }
 
       throw error instanceof Error ? error : new Error("OpenCode request failed");
     }

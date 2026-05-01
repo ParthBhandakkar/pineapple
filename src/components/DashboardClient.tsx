@@ -411,6 +411,18 @@ function selectedModelInfo(code: string) {
   return billingModels.find((model) => model.code === code) ?? billingModels[0];
 }
 
+function isModelProviderErrorMessage(message: string | null | undefined) {
+  const text = (message ?? "").toLowerCase();
+  return (
+    text.includes("model provider") ||
+    text.includes("upstream provider") ||
+    text.includes("openrouter") ||
+    text.includes("opencode upstream") ||
+    text.includes("guardrail restrictions") ||
+    text.includes("user not found")
+  );
+}
+
 async function readApiError(response: Response) {
   const text = await response.text().catch(() => "");
 
@@ -493,8 +505,32 @@ function decodeEscapedContent(value: string) {
   return decoded;
 }
 
+function normalizeArtifactFileContent(value: string) {
+  let normalized = decodeEscapedContent(value);
+
+  if (!normalized.includes("\n") && /\\n/.test(normalized)) {
+    normalized = normalized.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+  }
+
+  if (normalized.includes("\\\"") && /<html|<!doctype html|<body|<head/i.test(normalized)) {
+    normalized = normalized.replace(/\\"/g, "\"");
+  }
+
+  return normalized;
+}
+
+function normalizeArtifactFiles(artifact: ProjectArtifact): ProjectArtifact {
+  return {
+    ...artifact,
+    files: artifact.files.map((file) => ({
+      path: file.path.replace(/^\/+/, ""),
+      content: normalizeArtifactFileContent(file.content),
+    })),
+  };
+}
+
 function artifactFromUnknown(value: unknown): ProjectArtifact | null {
-  if (isProjectArtifact(value)) return value;
+  if (isProjectArtifact(value)) return normalizeArtifactFiles(value);
 
   if (value && typeof value === "object") {
     const maybeWrapped = value as { content?: unknown; artifact?: unknown; project?: unknown };
@@ -550,21 +586,29 @@ function buildPreviewHtml(artifact: ProjectArtifact) {
   const entry = artifact.files.find((file) => file.path === (artifact.entry ?? "index.html")) ?? artifact.files[0];
   if (!entry) return "";
   let html = entry.content;
+  const escapeForRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   for (const file of artifact.files) {
+    const normalizedPath = file.path.replace(/^[./]+/, "");
+    const pathVariants = Array.from(
+      new Set([normalizedPath, file.path, `./${normalizedPath}`, `/${normalizedPath}`]),
+    ).map(escapeForRegex);
+
     if (file.path.endsWith(".css")) {
-      const escapedPath = file.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      html = html.replace(
-        new RegExp(`<link([^>]+)href=["']${escapedPath}["']([^>]*)>`, "g"),
-        `<style>\n${file.content}\n</style>`,
-      );
+      for (const escapedPath of pathVariants) {
+        html = html.replace(
+          new RegExp(`<link([^>]*?)href=["']${escapedPath}["']([^>]*)>`, "g"),
+          `<style>\n${file.content}\n</style>`,
+        );
+      }
     }
     if (file.path.endsWith(".js")) {
-      const escapedPath = file.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      html = html.replace(
-        new RegExp(`<script([^>]+)src=["']${escapedPath}["']([^>]*)></script>`, "g"),
-        `<script>\n${file.content}\n</script>`,
-      );
+      for (const escapedPath of pathVariants) {
+        html = html.replace(
+          new RegExp(`<script([^>]*?)src=["']${escapedPath}["']([^>]*)></script>`, "g"),
+          `<script>\n${file.content}\n</script>`,
+        );
+      }
     }
   }
 
@@ -707,6 +751,7 @@ function DashboardInner() {
   const [profilePopoverOpen, setProfilePopoverOpen] = useState(false);
   const [headerProfileOpen, setHeaderProfileOpen] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
+  const [pendingMessagesByConversation, setPendingMessagesByConversation] = useState<Record<string, Message[]>>({});
   const [deployBusy, setDeployBusy] = useState(false);
   const [deployConfirmOpen, setDeployConfirmOpen] = useState(false);
   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
@@ -719,6 +764,7 @@ function DashboardInner() {
 
   const selectedBillingModel = selectedModelInfo(selectedModelCode);
   const modelSyncInFlightRef = useRef(false);
+  const pendingTaskToConversationRef = useRef<Record<string, string>>({});
 
   const allowedMaxMultiplier = data?.entitlement?.plan?.code
     ? getAllowedMaxMultiplier(data.entitlement.plan.code)
@@ -828,13 +874,24 @@ function DashboardInner() {
     for (const task of data.tasks) {
       const previous = lastSeenTaskStatusRef.current[task.id];
       if (previous && previous !== task.status) {
+        const pendingConversationId = pendingTaskToConversationRef.current[task.id];
+        if (pendingConversationId && ["COMPLETED", "FAILED", "REJECTED"].includes(task.status)) {
+          setPendingMessagesByConversation((current) => {
+            if (!current[pendingConversationId]) return current;
+            const next = { ...current };
+            delete next[pendingConversationId];
+            return next;
+          });
+          delete pendingTaskToConversationRef.current[task.id];
+        }
+
         if (task.status === "COMPLETED") {
           toast.show({
             tone: "success",
             title: "Task completed",
             body: `${formatNumber(task.tokenCost ?? 0)} token(s) consumed.`,
           });
-        } else if (task.status === "FAILED") {
+        } else if (task.status === "FAILED" && isModelProviderErrorMessage(task.result)) {
           toast.show({
             tone: "danger",
             title: "Task failed",
@@ -915,13 +972,37 @@ function DashboardInner() {
     setChatBusy(true);
 
     try {
+      let activeConversationId = conversationId;
+      if (!activeConversationId) {
+        const conversationResponse = await fetch("/api/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            agentId: selectedAgentId || undefined,
+            title: "New session",
+          }),
+        });
+        if (!conversationResponse.ok) {
+          toast.show({
+            tone: "danger",
+            title: "Could not create session",
+            body: await readApiError(conversationResponse),
+          });
+          setChatBusy(false);
+          return;
+        }
+        const conversationBody = (await conversationResponse.json()) as { conversation: Conversation };
+        activeConversationId = conversationBody.conversation.id;
+        setConversationId(activeConversationId);
+      }
+
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: promptPayload,
           agentId: selectedAgentId || undefined,
-          conversationId: conversationId || undefined,
+          conversationId: activeConversationId || undefined,
           modelCode: selectedModelCode,
         }),
       });
@@ -955,6 +1036,28 @@ function DashboardInner() {
           body: "This high-risk action is awaiting your approval in Requests.",
         });
       } else if (body.status === "RUNNING" || body.status === "QUEUED") {
+        const nowIso = new Date().toISOString();
+        setPendingMessagesByConversation((current) => ({
+          ...current,
+          [activeConversationId]: [
+            ...(current[activeConversationId] ?? []),
+            {
+              id: `pending-user-${Date.now()}`,
+              role: "USER",
+              content: promptPayload,
+              createdAt: nowIso,
+            },
+            {
+              id: `pending-assistant-${Date.now()}`,
+              role: "ASSISTANT",
+              content: "waiting...",
+              createdAt: nowIso,
+            },
+          ],
+        }));
+        if (body.task?.id) {
+          pendingTaskToConversationRef.current[body.task.id] = activeConversationId;
+        }
         toast.show({
           tone: "info",
           title: "Working on it",
@@ -1381,6 +1484,12 @@ function DashboardInner() {
   const selectedNewAgentIds = selectedAgentIds.filter((id) => !deployedAgentIds.includes(id));
   const selectedNewAgents = data.agents.filter((agent) => selectedNewAgentIds.includes(agent.id));
   const selectedConversation = data.conversations.find((item) => item.id === conversationId);
+  const selectedConversationWithPending = selectedConversation
+    ? {
+        ...selectedConversation,
+        messages: [...selectedConversation.messages, ...(pendingMessagesByConversation[selectedConversation.id] ?? [])],
+      }
+    : selectedConversation;
   const pendingApprovals = data.approvals.filter((a) => a.status === "PENDING");
   const monthlyCap = data.entitlement.plan.monthlyTokens;
   const subRem = data.wallet?.subscriptionTokensRemaining ?? 0;
@@ -1704,7 +1813,7 @@ function DashboardInner() {
             conversationId={conversationId}
             setConversationId={setConversationId}
             createConversation={createConversation}
-            selectedConversation={selectedConversation}
+            selectedConversation={selectedConversationWithPending}
             chatLogRef={chatLogRef}
             chatBusy={chatBusy}
             sendPrompt={sendPrompt}

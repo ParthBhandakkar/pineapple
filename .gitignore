@@ -2,6 +2,8 @@
 node_modules/
 .env
 .env*.local
+.env.production
+.env.production.*
 dev.db
 prisma/dev.db
 *.log
