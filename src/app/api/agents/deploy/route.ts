@@ -4,6 +4,7 @@ import { fail, HttpError, ok } from "@/lib/http";
 import { prisma } from "@/lib/prisma";
 import { getActiveEntitlement } from "@/lib/tokens";
 import { writeLog } from "@/lib/logs";
+import { isTestingUnlimited } from "@/lib/testing-unlimited";
 
 const deploySchema = z.object({
   agentIds: z.array(z.string()).min(1),
@@ -21,7 +22,11 @@ export async function POST(request: Request) {
       throw new HttpError(400, "One or more selected agents are unavailable");
     }
 
-    if (entitlement.plan.code === "free" && agents.some((agent) => !agent.isDefault)) {
+    if (
+      !isTestingUnlimited() &&
+      entitlement.plan.code === "free" &&
+      agents.some((agent) => !agent.isDefault)
+    ) {
       throw new HttpError(402, "Please activate a subscription to deploy marketplace agents");
     }
 
@@ -37,8 +42,9 @@ export async function POST(request: Request) {
       throw new HttpError(409, "Selected agents are already deployed");
     }
 
-    if (deployedCount + newAgentIds.length > entitlement.plan.maxAgents) {
-      throw new HttpError(400, `Your plan allows ${entitlement.plan.maxAgents} deployed agent(s)`);
+    const maxDeploySlots = isTestingUnlimited() ? 999 : entitlement.plan.maxAgents;
+    if (deployedCount + newAgentIds.length > maxDeploySlots) {
+      throw new HttpError(400, `Your plan allows ${maxDeploySlots} deployed agent(s)`);
     }
 
     await prisma.$transaction(

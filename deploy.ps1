@@ -4,7 +4,9 @@ param(
     [string]$ArchiveName = "agentsim-deploy-current.tgz",
     [string]$RemoteArchive = "/tmp/agentsim-deploy-current.tgz",
     [switch]$SkipHealthCheck,
-    [switch]$NoCleanup
+    [switch]$NoCleanup,
+    # Overwrites /opt/agentsim/.env.production with this repo's copy (secrets — use only when intentional).
+    [switch]$SyncDotenv
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,13 +32,29 @@ Set-Location $repoRoot
 $archivePath = Join-Path $repoRoot $ArchiveName
 $tmpRemoteScript = $null
 
+if ($SyncDotenv) {
+    $dotenvPath = Join-Path $repoRoot ".env.production"
+    if (-not (Test-Path $dotenvPath)) {
+        throw ".env.production not found — nothing to sync."
+    }
+    Write-Host ">>> Including .env.production (will overwrite the copy under $RemotePath on the server)."
+}
+
 Write-Host "Creating archive: $archivePath"
-& tar -czf $archivePath --exclude=".git" --exclude="node_modules" --exclude=".next" --exclude=".venv" --exclude=".env.production" --exclude=".env" --exclude="agentsim-deploy*.tgz" .
+$tarArgs = @("-czf", $archivePath, "--exclude=.git", "--exclude=node_modules", "--exclude=.next", "--exclude=.venv")
+if (-not $SyncDotenv) {
+    $tarArgs += "--exclude=.env.production"
+}
+$tarArgs += @("--exclude=.env", "--exclude=agentsim-deploy*.tgz", ".")
+& tar @tarArgs
 
 try {
     Write-Host "Uploading archive to VM: ${RemoteHost}:$RemoteArchive"
     & scp -o StrictHostKeyChecking=no $archivePath "${RemoteHost}:$RemoteArchive"
 
+    $excludeProdLine = if ($SyncDotenv) { "" } else { @"
+  --exclude ".env.production" \
+"@ }
     $remoteScript = @"
 set -euo pipefail
 
@@ -49,8 +67,7 @@ mkdir -p "`$EXTRACT_DIR"
 tar -xzf "`$UPLOAD" -C "`$EXTRACT_DIR"
 
 rsync -a --delete \
-  --exclude ".env.production" \
-  --exclude ".env" \
+$excludeProdLine  --exclude ".env" \
   --exclude ".env.local" \
   --exclude ".next" \
   --exclude ".venv" \

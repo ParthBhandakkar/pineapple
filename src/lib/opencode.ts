@@ -160,7 +160,12 @@ export async function promptOpenCodeSession(
     throw new Error(`OpenCode prompt failed: ${response.status} ${body}`);
   }
 
-  const payload = (await response.json()) as OpenCodeMessageResponse;
+  let payload: OpenCodeMessageResponse;
+  try {
+    payload = (await response.json()) as OpenCodeMessageResponse;
+  } catch {
+    throw new Error("OpenCode returned invalid JSON for message response");
+  }
 
   const providerErrorMessage = payload.info?.error?.data?.message?.trim();
   if (providerErrorMessage) {

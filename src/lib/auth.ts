@@ -8,7 +8,14 @@ const SESSION_COOKIE = "agentsim_session";
 const SESSION_DAYS = 30;
 
 function sessionSecret() {
-  return process.env.SESSION_SECRET ?? "dev-only-agent-sim-session-secret";
+  const secret = process.env.SESSION_SECRET;
+  if (!secret) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("SESSION_SECRET must be set in production");
+    }
+    return "dev-only-agent-sim-session-secret";
+  }
+  return secret;
 }
 
 function useSecureCookies() {

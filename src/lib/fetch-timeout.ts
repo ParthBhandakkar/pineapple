@@ -1,5 +1,5 @@
-/** Default for OpenRouter + OpenCode chat-style calls (ms). */
-const DEFAULT_MODEL_MS = 120_000;
+/** Default for OpenRouter + OpenCode chat-style calls (ms). Override with MODEL_REQUEST_TIMEOUT_MS. */
+const DEFAULT_MODEL_MS = 300_000;
 
 function timeoutMs(override?: number) {
   const fromEnv = Number(process.env.MODEL_REQUEST_TIMEOUT_MS);

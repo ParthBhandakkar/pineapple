@@ -20,8 +20,9 @@ export async function createRazorpayOrder(input: CreateOrderInput) {
     };
   }
 
+  const razorpayApiBase = process.env.RAZORPAY_API_BASE_URL ?? "https://api.razorpay.com";
   const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
-  const response = await fetch("https://api.razorpay.com/v1/orders", {
+  const response = await fetch(`${razorpayApiBase}/v1/orders`, {
     method: "POST",
     headers: {
       Authorization: `Basic ${auth}`,

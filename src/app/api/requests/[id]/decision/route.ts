@@ -7,6 +7,7 @@ import { writeLog } from "@/lib/logs";
 import { getAllowedMaxMultiplier, getBillingModel } from "@/lib/models";
 import { getActiveEntitlement } from "@/lib/tokens";
 import { logError } from "@/lib/error-logger";
+import { isTestingUnlimited } from "@/lib/testing-unlimited";
 
 const decisionSchema = z.object({
   decision: z.enum(["APPROVED", "REJECTED"]),
@@ -90,7 +91,9 @@ export async function POST(request: Request, context: RouteContext) {
 
     const entitlement = await getActiveEntitlement(user.id);
     const selectedModel = getBillingModel(requestPayload.billingModelCode);
-    const allowedMaxMultiplier = getAllowedMaxMultiplier(entitlement.plan.code);
+    const allowedMaxMultiplier = isTestingUnlimited()
+      ? Number.POSITIVE_INFINITY
+      : getAllowedMaxMultiplier(entitlement.plan.code);
 
     if (selectedModel.multiplier > allowedMaxMultiplier) {
       throw new HttpError(

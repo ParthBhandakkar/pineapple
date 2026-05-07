@@ -13,13 +13,16 @@ import { executeTask } from "@/lib/execution";
 import { writeLog } from "@/lib/logs";
 import { logError } from "@/lib/error-logger";
 import { getAllowedMaxMultiplier, getBillingModel } from "@/lib/models";
+import { isTestingUnlimited } from "@/lib/testing-unlimited";
+
+export const maxDuration = 60;
 
 const chatSchema = z.object({
   prompt: z.string().min(1).max(20000),
   agentId: z.string().optional(),
   conversationId: z.string().optional(),
   modelCode: z.string().optional(),
-  // Used for backend-only "model sync" prompts that must not be persisted as chat messages.
+  images: z.array(z.string().max(10_000_000)).max(5).optional(),
   silent: z.boolean().optional(),
 });
 
@@ -27,9 +30,17 @@ export async function POST(request: Request) {
   try {
     const user = await requireUser();
     const body = chatSchema.parse(await request.json());
+
+    if (body.images?.length) {
+      console.log(`[chat] received ${body.images.length} image(s), first ${body.images[0].slice(0, 40)}...`);
+    }
+
     const entitlement = await getActiveEntitlement(user.id);
     const selectedModel = getBillingModel(body.modelCode);
-    const allowedMaxMultiplier = getAllowedMaxMultiplier(entitlement.plan.code);
+    const testingUnlimited = isTestingUnlimited();
+    const allowedMaxMultiplier = testingUnlimited
+      ? Number.POSITIVE_INFINITY
+      : getAllowedMaxMultiplier(entitlement.plan.code);
     const conversation = body.conversationId
       ? await prisma.conversation.findFirst({
           where: { id: body.conversationId, userId: user.id },
@@ -61,7 +72,7 @@ export async function POST(request: Request) {
       });
     }
 
-    if (entitlement.plan.code === "free") {
+    if (!testingUnlimited && entitlement.plan.code === "free") {
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const dailyTaskCount = await prisma.agentTask.count({
@@ -77,20 +88,24 @@ export async function POST(request: Request) {
       }
     }
 
-    const wallet = await resetSubscriptionTokensIfNeeded(user.id);
-    if (selectedModel.multiplier > allowedMaxMultiplier) {
-      throw new HttpError(
-        403,
-        `Selected model multiplier (×${selectedModel.multiplier}) exceeds your plan limit (max ×${allowedMaxMultiplier}). Upgrade your subscription to use this model.`
-      );
+    if (!testingUnlimited) {
+      const wallet = await resetSubscriptionTokensIfNeeded(user.id);
+      if (selectedModel.multiplier > allowedMaxMultiplier) {
+        throw new HttpError(
+          403,
+          `Selected model multiplier (×${selectedModel.multiplier}) exceeds your plan limit (max ×${allowedMaxMultiplier}). Upgrade your subscription to use this model.`
+        );
+      }
+
+      const tokenCost = estimateChargeWithMultiplier(body.prompt, selectedModel.multiplier);
+
+      if (wallet.subscriptionTokensRemaining + wallet.purchasedTokensRemaining < tokenCost) {
+        throw new HttpError(402, "Insufficient token balance. Please upgrade or buy a token pack.");
+      }
     }
 
     const tokenCost = estimateChargeWithMultiplier(body.prompt, selectedModel.multiplier);
     const estimatedBaseTokens = estimateTaskCost(body.prompt);
-
-    if (wallet.subscriptionTokensRemaining + wallet.purchasedTokensRemaining < tokenCost) {
-      throw new HttpError(402, "Insufficient token balance. Please upgrade or buy a token pack.");
-    }
 
     const agent = body.agentId
       ? await prisma.userAgent.findFirst({
@@ -165,7 +180,7 @@ export async function POST(request: Request) {
     // Caddy/Cloudflare 60-100s window) and lets the UI render the queued
     // task right away. The dashboard polls /api/bootstrap and watches the
     // task transition from QUEUED -> RUNNING -> COMPLETED/FAILED.
-    void executeTask({ taskId: task.id, billingModelCode: selectedModel.code }).catch((error) => {
+    void executeTask({ taskId: task.id, billingModelCode: selectedModel.code, images: body.images }).catch((error) => {
       logError("Background task execution failed", error, {
         taskId: task.id,
         userId: user.id,

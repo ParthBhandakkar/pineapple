@@ -10,20 +10,10 @@ type ExecuteTaskInput = {
   taskId: string;
   approved?: boolean;
   billingModelCode?: string | null;
-  retryCount?: number;
+  images?: string[];
 };
 
-const MAX_TRANSIENT_RETRIES = 4;
-
-function isTransientGenerationError(error: unknown) {
-  if (!(error instanceof Error)) return false;
-  if (error.name === "AbortError") return true;
-  const msg = error.message.toLowerCase();
-  return msg.includes("timed out") || msg.includes("timeout") || msg.includes("fetch failed") || msg.includes("network");
-}
-
 export async function executeTask(input: ExecuteTaskInput) {
-  const retryCount = input.retryCount ?? 0;
   const task = await prisma.agentTask.findUniqueOrThrow({
     where: { id: input.taskId },
     include: {
@@ -57,20 +47,20 @@ export async function executeTask(input: ExecuteTaskInput) {
     }));
 
   if (!conversation.opencodeSessionId && process.env.OPENCODE_SERVER_URL) {
-    const openCodeSession = await createOpenCodeSession(conversation.title);
-
-    if (!openCodeSession?.id) {
-      await prisma.agentTask.update({
-        where: { id: task.id },
-        data: { status: "FAILED", result: "Unable to initialize OpenCode session for this conversation." },
+    const openCodeSession = await createOpenCodeSession(conversation.title).catch((err) => {
+      logError("OpenCode session bootstrap failed", err, {
+        userId: task.userId,
+        conversationId: conversation.id,
       });
-      throw new Error("Unable to initialize OpenCode session for this task.");
-    }
-
-    conversation = await prisma.conversation.update({
-      where: { id: conversation.id },
-      data: { opencodeSessionId: openCodeSession.id },
+      return null;
     });
+
+    if (openCodeSession?.id) {
+      conversation = await prisma.conversation.update({
+        where: { id: conversation.id },
+        data: { opencodeSessionId: openCodeSession.id },
+      });
+    }
   }
 
   const estimatedBaseTokens = estimateTaskCost(task.prompt);
@@ -88,33 +78,10 @@ export async function executeTask(input: ExecuteTaskInput) {
       conversationId: conversation.id,
       opencodeSessionId: conversation.opencodeSessionId,
       billingModelCode: selectedModel.code,
+      images: input.images,
     });
   } catch (error) {
     logError("Model generation failed", error, { taskId: task.id, userId: task.userId });
-
-    if (isTransientGenerationError(error) && retryCount < MAX_TRANSIENT_RETRIES) {
-      const delayMs = Math.min(20_000, 4_000 * (retryCount + 1));
-      await prisma.agentTask.update({
-        where: { id: task.id },
-        data: {
-          status: "QUEUED",
-          result: "Waiting for model response...",
-        },
-      });
-      setTimeout(() => {
-        void executeTask({
-          ...input,
-          retryCount: retryCount + 1,
-        }).catch((retryError) => {
-          logError("Background retry execution failed", retryError, {
-            taskId: task.id,
-            userId: task.userId,
-            retryCount: retryCount + 1,
-          });
-        });
-      }, delayMs);
-      return task;
-    }
 
     const message =
       error instanceof Error && error.name === "AbortError"
@@ -176,8 +143,44 @@ export async function executeTask(input: ExecuteTaskInput) {
       role: "ASSISTANT",
       content: assistantContent,
       tokenEstimate: tokenCost,
+      modelUsed: generated.model ?? selectedModel.openRouterModel ?? selectedModel.code,
     },
   });
+
+  // Auto-save project artifact files to user's workspace
+  try {
+    const artifactMatch = assistantContent.match(/```pineapple-project\s*([\s\S]*?)```/);
+    if (artifactMatch) {
+      let jsonStr = artifactMatch[1].trim();
+      // Handle cases where the JSON might have literal \n in file contents stored as \\n
+      let artifact;
+      try {
+        artifact = JSON.parse(jsonStr);
+      } catch {
+        // Try normalizing escaped characters
+        jsonStr = jsonStr.replace(/\\n/g, "\n").replace(/\\"/g, '"');
+        try { artifact = JSON.parse(jsonStr); } catch { /* give up */ }
+      }
+      if (artifact?.files?.length) {
+        for (const file of artifact.files) {
+          if (file.path && file.content) {
+            await prisma.userFile.upsert({
+              where: { userId_path: { userId: task.userId, path: file.path } },
+              update: { content: file.content, sizeBytes: Buffer.byteLength(file.content, "utf-8") },
+              create: {
+                userId: task.userId,
+                path: file.path,
+                content: file.content,
+                sizeBytes: Buffer.byteLength(file.content, "utf-8"),
+              },
+            });
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-critical — don't fail the task if workspace save fails
+  }
 
   const updated = await prisma.agentTask.update({
     where: { id: task.id },

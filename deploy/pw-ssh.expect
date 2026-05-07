@@ -1,0 +1,25 @@
+#!/usr/bin/expect -f
+# Usage: DEPLOY_SSH_PASSWORD=... pw-ssh.expect <user@host> <remote shell command>
+# The remote command is argv[1..end] joined with spaces (pass one quoted string from bash).
+set timeout -1
+if {![info exists env(DEPLOY_SSH_PASSWORD)]} {
+  puts stderr "DEPLOY_SSH_PASSWORD is not set"
+  exit 2
+}
+set pw $env(DEPLOY_SSH_PASSWORD)
+if {[llength $argv] < 2} {
+  puts stderr "usage: pw-ssh.expect user@host \"remote command\""
+  exit 2
+}
+set host [lindex $argv 0]
+set remote [join [lrange $argv 1 end]]
+log_user 1
+# Single Tcl word $remote becomes one argv token for ssh (remote command string).
+spawn ssh -o StrictHostKeyChecking=no $host $remote
+expect {
+  -re "(?i)yes/no" { send "yes\r"; exp_continue }
+  -re "(?i)password:" { send "$pw\r"; exp_continue }
+  eof
+}
+catch wait result
+exit [lindex $result 3]

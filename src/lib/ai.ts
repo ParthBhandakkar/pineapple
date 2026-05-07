@@ -3,6 +3,7 @@ import { fetchWithModelTimeout } from "@/lib/fetch-timeout";
 import { promptOpenCodeSession } from "@/lib/opencode";
 import { getBillingModel } from "@/lib/models";
 import { logError } from "@/lib/error-logger";
+import { estimateTaskCost } from "@/lib/tokens";
 
 type GenerateInput = {
   userId: string;
@@ -11,6 +12,7 @@ type GenerateInput = {
   conversationId?: string;
   opencodeSessionId?: string | null;
   billingModelCode?: string | null;
+  images?: string[];
 };
 
 type GenerateResult = {
@@ -38,6 +40,99 @@ type ProjectArtifactPayload = {
 const FORCE_OPENCODE_ONLY =
   process.env.FORCE_OPENCODE_ONLY === "true";
 
+const OPENROUTER_MAX_ATTEMPTS = Number(process.env.OPENROUTER_MAX_ATTEMPTS) || 8;
+
+const OPENROUTER_API_URL =
+  process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1/chat/completions";
+
+const OPENROUTER_FALLBACK_MODEL =
+  process.env.OPENROUTER_FALLBACK_MODEL ?? "openrouter/auto";
+
+const MAX_CONVERSATION_HISTORY = 20;
+const CODING_TIMEOUT_MS = 270_000;
+const NON_CODING_TIMEOUT_MS = 240_000;
+const CODING_MAX_TOKENS = 3000;
+const NON_CODING_MAX_TOKENS = 1024;
+const REPAIR_MAX_TOKENS = 2200;
+const REPAIR_TIMEOUT_MS = 200_000;
+const BACKOFF_BASE_MS = 1600;
+const BACKOFF_MAX_MS = 24_000;
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** Only these should surface as a FAILED task when OPENROUTER_API_KEY is set. */
+function isOpenRouterCreditExhaustedMessage(message: string) {
+  const t = message.toLowerCase();
+  return (
+    t.includes("(402)") ||
+    t.includes("requires more credits") ||
+    t.includes("insufficient token") ||
+    (t.includes("insufficient") && t.includes("credit")) ||
+    t.includes("you need to purchase") ||
+    (t.includes("quota") && t.includes("exceeded") && t.includes("bill"))
+  );
+}
+
+function isOpenRouterAuthConfigMessage(message: string) {
+  const t = message.toLowerCase();
+  return (
+    t.includes("(401)") ||
+    t.includes("(403)") ||
+    t.includes("check openrouter_api_key") ||
+    t.includes("invalid api key")
+  );
+}
+
+function guaranteedOpenRouterResult(
+  input: GenerateInput,
+  modelText: string,
+  fallbackNotice: string | undefined,
+  lastError: Error | null,
+): GenerateResult {
+  const selectedModel = getBillingModel(input.billingModelCode);
+  const coding = isCodingProjectRequest(input.prompt);
+  const est = estimateTaskCost(input.prompt);
+  const notice = [
+    fallbackNotice,
+    lastError
+      ? `Model connectivity failed after retries (${lastError.message.slice(0, 200)}). Delivering a fallback response.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  if (coding) {
+    const content = fallbackProjectArtifactContent(input.prompt);
+    return {
+      content: notice ? `${notice}\n\n${content}` : content,
+      model: "fallback-local",
+      totalTokens: est,
+      selectedModelCode: selectedModel.code,
+      selectedModelMultiplier: selectedModel.multiplier,
+      fallbackNotice: notice || undefined,
+    };
+  }
+
+  const msg = [
+    "I could not reach the AI provider after several attempts.",
+    lastError ? `Detail: ${lastError.message.slice(0, 280)}` : "",
+    "Please try again in a few minutes.",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  return {
+    content: notice ? `${notice}\n\n${msg}` : msg,
+    model: "fallback-local",
+    totalTokens: est,
+    selectedModelCode: selectedModel.code,
+    selectedModelMultiplier: selectedModel.multiplier,
+    fallbackNotice: notice || undefined,
+  };
+}
+
 function isModelIdentityQuestion(prompt: string) {
   const p = prompt.toLowerCase();
   return (
@@ -59,29 +154,33 @@ function isSimpleGreeting(prompt: string) {
   return /^(hi|hello|hey)\s*[!?.]*$/.test(p);
 }
 
+/** Option A: verb-only check — controls longer timeouts, higher max_tokens, and repair passes. */
 function isCodingProjectRequest(prompt: string) {
   const p = prompt.toLowerCase();
-  return (
-    /\b(create|build|make|generate|code|develop)\b/.test(p) &&
-    /\b(website|web site|site|portfolio|landing page|page|project|app|application|html|css|javascript|react|next\.?js|code|ecommerce|commerce|store|shop|saas|dashboard|blog)\b/.test(p)
-  );
+  return /\b(create|build|make|generate|code|develop|design|implement|write|craft|set\s*up|scaffold|put\s+together|give\s+me|i\s+want|i\s+need)\b/.test(p);
 }
 
 const BASE_AGENT_SYSTEM =
   "You are an agent inside PineApple. Be concise, action-oriented, and do not claim that high-risk actions were executed unless an explicit approval flow has already completed. IMPORTANT: Do NOT include any hidden reasoning, 'thinking', or analysis. Do not call tools. Output only the final answer.";
 
+/**
+ * Option B: artifact instructions are always present so the model decides
+ * when to produce files vs. answer conversationally.
+ */
 const PROJECT_ARTIFACT_SYSTEM = [
-  "When the user asks you to build, code, create, or generate a website, app, landing page, dashboard, ecommerce store, or similar project, return a complete preview-ready project artifact.",
+  "When the user asks you to build, code, create, generate, design, or produce ANY kind of software, website, app, tool, game, chatbot, clone, widget, component, or similar — return a complete project artifact.",
+  "If the user's request is clearly NOT asking for code or a buildable project (e.g. a factual question, explanation, debugging help, or general conversation), respond with normal text instead.",
   "Do not use tools, do not write files to the server filesystem, and do not describe a project without providing the files.",
-  "Your answer must include one short intro sentence, then exactly one fenced block tagged pineapple-project.",
-  "Inside that fenced block, output valid JSON only with this shape: {\"name\":\"Project name\",\"entry\":\"index.html\",\"files\":[{\"path\":\"index.html\",\"content\":\"...\"}]}",
-  "Always return a real multi-file structure. Minimum files: index.html, styles.css, script.js. Add extra files/folders when useful for clarity.",
-  "Do not collapse everything into one escaped string or one giant index.html unless the user explicitly asks for single-file output.",
+  "CRITICAL FORMAT: Your response must be ONLY one short intro sentence (max 1-2 lines), followed IMMEDIATELY by the pineapple-project fenced block. Do NOT include directory trees, setup instructions, feature lists, or any other markdown content before or after the artifact block. All documentation should be inside a README.md file within the artifact.",
+  "The fenced block must be tagged exactly as: ```pineapple-project",
+  "Inside that fenced block, output valid JSON only with this shape: {\"name\":\"Descriptive project name\",\"entry\":\"<main entry file>\",\"files\":[{\"path\":\"<filepath>\",\"content\":\"...\"}]}",
+  "IMPORTANT: Use the language and technology the user asked for. If they say Python, use .py files with entry like app.py or main.py. If they say JavaScript/Node, use .js files. If they say HTML/web, use index.html + styles.css + script.js. Match the user's requested language — do NOT default to HTML/CSS/JS unless the request is for a web page.",
+  "The number of files and their types are entirely up to you based on what the project needs. Use as many or as few files as makes sense for the project. Do not artificially pad or restrict file count.",
   "Each file.content must be plain file text (normal newlines), not double-escaped JSON strings.",
-  "Keep the artifact compact: no external fonts, no external icon libraries, no giant placeholder content, and no unnecessary framework setup unless the user asked for it.",
-  "Satisfy the user's exact product/domain request. For ecommerce, include product listing, cart state, account button, add-to-cart behavior, totals, and a usable checkout/account surface.",
-  "Never reuse unrelated portfolio, agency, selected-work, or contact-template copy unless the user asked for a portfolio.",
-  "The preview opens the entry file directly, so all CSS and JS must be referenced by relative paths that exist in files.",
+  "Keep the artifact compact: no unnecessary placeholder content and no framework setup unless the user asked for it.",
+  "Satisfy the user's exact product/domain request with working, functional code — not stubs or placeholders.",
+  "For web projects, the preview opens the entry file directly, so all CSS and JS must be referenced by relative paths that exist in files.",
+  "Include a README.md file with setup instructions, features list, and project structure documentation inside the artifact.",
 ].join(" ");
 
 function buildSystemPrompt(input: GenerateInput, modelText: string) {
@@ -89,11 +188,9 @@ function buildSystemPrompt(input: GenerateInput, modelText: string) {
     BASE_AGENT_SYSTEM,
     `Current UI-selected model: ${modelText}.`,
     `If the user asks "which model are you" / "what model are you" / "what model are you using" or similar, respond with ONLY this exact text: "${modelText}". No additional words. No explanations.`,
+    `IMPORTANT: You do NOT have internet/web access. You cannot browse URLs, search the web, fetch live data, or access external APIs. If the user asks you to search the web, visit a URL, or get real-time information, politely inform them that web access is not available yet and offer to help with what you can do offline.`,
+    PROJECT_ARTIFACT_SYSTEM,
   ];
-
-  if (isCodingProjectRequest(input.prompt)) {
-    parts.push(PROJECT_ARTIFACT_SYSTEM);
-  }
 
   return parts.join("\n\n");
 }
@@ -185,14 +282,19 @@ function extractProjectArtifact(value: unknown): { name: string; entry?: string;
 
 function extractProjectArtifactFromText(content: string) {
   const normalized = decodeEscapedContent(content);
-  const fenced = normalized.match(/```(?:pineapple-project|json)?\s*([\s\S]*?)```/);
+  const fenced = normalized.match(/```(?:pineapple-project|json)?[\s\S]*?(\{[\s\S]*\})[\s\S]*?```/);
   if (fenced) {
     return extractProjectArtifact(parseJsonObjectSlice(fenced[1]));
+  }
+  const simpleFenced = normalized.match(/```(?:pineapple-project|json)?\s*([\s\S]*?)```/);
+  if (simpleFenced) {
+    const inner = simpleFenced[1].replace(/^\s*pineapple-project\s*/i, "");
+    return extractProjectArtifact(parseJsonObjectSlice(inner));
   }
   return extractProjectArtifact(parseJsonObjectSlice(normalized));
 }
 
-function hasUsableProjectArtifact(content: string, minFiles = 3) {
+function hasUsableProjectArtifact(content: string, minFiles = 1) {
   const artifact = extractProjectArtifactFromText(content);
   return Boolean(
     artifact &&
@@ -202,60 +304,12 @@ function hasUsableProjectArtifact(content: string, minFiles = 3) {
 }
 
 function fallbackProjectArtifactContent(prompt: string) {
-  const artifact = {
-    name: "Generated Project",
-    entry: "index.html",
-    files: [
-      {
-        path: "index.html",
-        content: `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Generated Project</title>
-  <link rel="stylesheet" href="styles.css" />
-</head>
-<body>
-  <main class="container">
-    <h1>Generated Project</h1>
-    <p class="lead">Built from your request:</p>
-    <pre class="prompt"></pre>
-    <button id="actionBtn">Click me</button>
-    <p id="status"></p>
-  </main>
-  <script src="script.js"></script>
-</body>
-</html>`,
-      },
-      {
-        path: "styles.css",
-        content: `:root { color-scheme: light dark; }
-* { box-sizing: border-box; }
-body { margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-.container { max-width: 760px; margin: 40px auto; padding: 24px; }
-.lead { margin: 0 0 12px; opacity: 0.85; }
-.prompt { white-space: pre-wrap; padding: 12px; border-radius: 10px; background: rgba(120,120,120,0.12); }
-button { margin-top: 16px; padding: 10px 14px; border-radius: 8px; border: 0; cursor: pointer; }`,
-      },
-      {
-        path: "script.js",
-        content: `const promptText = ${JSON.stringify(prompt)};
-document.querySelector(".prompt").textContent = promptText;
-const status = document.getElementById("status");
-document.getElementById("actionBtn").addEventListener("click", () => {
-  status.textContent = "Interaction works.";
-});`,
-      },
-    ],
-  };
-
   return [
-    "I've created a complete project structure for you.",
+    "The AI model could not be reached after several attempts, so I was unable to generate the project you requested.",
     "",
-    "```pineapple-project",
-    JSON.stringify(artifact, null, 2),
-    "```",
+    `**Your request:** ${prompt.slice(0, 300)}`,
+    "",
+    "Please try again — the model may be temporarily overloaded. Your request will be fulfilled on the next successful attempt.",
   ].join("\n");
 }
 
@@ -293,13 +347,33 @@ async function getConversationHistory(userId: string, conversationId?: string) {
   const messages = await prisma.message.findMany({
     where: { userId, conversationId },
     orderBy: { createdAt: "asc" },
-    take: 20,
+    take: MAX_CONVERSATION_HISTORY,
   });
 
   return messages.map((message) => ({
     role: message.role === "USER" ? "user" : message.role === "ASSISTANT" ? "assistant" : "system",
     content: message.content,
   }));
+}
+
+function extractLastArtifactContext(history: Array<{ role: string; content: string }>): string | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (msg.role !== "assistant") continue;
+    const match = msg.content.match(/```pineapple-project\s*([\s\S]*?)```/);
+    if (match) {
+      try {
+        const artifact = JSON.parse(match[1]);
+        if (artifact?.files?.length) {
+          const filesSummary = artifact.files
+            .map((f: { path: string; content: string }) => `--- ${f.path} ---\n${f.content}`)
+            .join("\n\n");
+          return `[EXISTING PROJECT CONTEXT]\nThe user previously generated this project. When they ask for changes, modifications, edits, fixes, or improvements:\n1. MODIFY the existing files — do not regenerate everything from scratch.\n2. Keep all existing logic/code intact unless the user specifically asks to change it.\n3. Only change the specific parts the user asks about.\n4. If they ask for a UI change, only modify UI code. If they ask for a logic change, only modify the logic.\n5. Return the full updated project artifact with ALL files (unchanged files should keep their original content).\n\nProject: ${artifact.name}\nFiles:\n${filesSummary}`;
+        }
+      } catch { /* ignore parse errors */ }
+    }
+  }
+  return null;
 }
 
 function summarizeOpenRouterError(status: number, body: string, openrouterModel: string) {
@@ -316,6 +390,9 @@ function summarizeOpenRouterError(status: number, body: string, openrouterModel:
   if (status === 401 || status === 403) {
     return `Model provider rejected the request (${status}). Check OPENROUTER_API_KEY.${detail ? ` ${detail}` : ""}`;
   }
+  if (status === 402) {
+    return `Model provider requires more credits or payment (${status}).${detail ? ` ${detail}` : ""}`;
+  }
   if (status === 404) {
     return `The selected model "${openrouterModel}" is unavailable on OpenRouter right now. Pick a different model from the dropdown.${detail ? ` ${detail}` : ""}`;
   }
@@ -326,40 +403,54 @@ function summarizeOpenRouterError(status: number, body: string, openrouterModel:
     return `Model provider rate-limited the request. Try again shortly or pick a different model.${detail ? ` ${detail}` : ""}`;
   }
 
-  return `Model provider failed (${status}).${detail ? ` ${detail}` : ""}`;
+  return `Model provider failed (${status}).${detail ? ` ${detail}` : ""}${trimmed.includes("image_parse_error") || trimmed.includes("Could not process image") ? " [image_error]" : ""}`;
 }
 
-function isOpenCodeProviderFailure(error: unknown) {
-  if (!(error instanceof Error)) return false;
-  const text = error.message.toLowerCase();
-  return (
-    text.includes("opencode upstream provider error") ||
-    text.includes("no assistant text") ||
-    text.includes("requires more credits") ||
-    text.includes("guardrail restrictions")
-  );
-}
-
-async function generateOpenRouterResponse(
+async function openRouterSingleAttempt(
   input: GenerateInput,
   modelText: string,
-  fallbackNotice?: string,
+  fallbackNotice: string | undefined,
+  attemptIndex: number,
 ): Promise<GenerateResult> {
   const selectedModel = getBillingModel(input.billingModelCode);
   const identityQuestion = isModelIdentityQuestion(input.prompt);
   const codingProjectRequest = isCodingProjectRequest(input.prompt);
-  const apiKey = process.env.OPENROUTER_API_KEY;
+  const apiKey = process.env.OPENROUTER_API_KEY!;
 
-  if (!apiKey) {
-    throw new Error("OpenRouter is not configured. Set OPENROUTER_API_KEY to generate model responses.");
-  }
+  const useAutoModel = attemptIndex >= OPENROUTER_MAX_ATTEMPTS - 2;
+  const hasInputImages = input.images && input.images.length > 0;
+  const VISION_MODEL = process.env.OPENROUTER_VISION_MODEL ?? "openai/gpt-4o";
+  // When images are present, always use a proven vision-capable model to avoid provider routing issues
+  const openrouterModel = hasInputImages
+    ? VISION_MODEL
+    : useAutoModel
+      ? OPENROUTER_FALLBACK_MODEL
+      : selectedModel.openRouterModel || OPENROUTER_FALLBACK_MODEL;
 
   const history = await getConversationHistory(input.userId, input.conversationId);
-  // Always keep the runtime OpenRouter selection aligned with the UI-selected billing model.
-  const openrouterModel = selectedModel.openRouterModel || "openrouter/auto";
+  const artifactContext = extractLastArtifactContext(history);
+  const mainTimeoutMs = codingProjectRequest ? CODING_TIMEOUT_MS : NON_CODING_TIMEOUT_MS;
+  const systemPrompt = artifactContext
+    ? `${buildSystemPrompt(input, modelText)}\n\n${artifactContext}`
+    : buildSystemPrompt(input, modelText);
+
+  // Build user message: multimodal if images are attached, plain text otherwise
+  if (hasInputImages) {
+    console.log(`[ai] Sending ${input.images!.length} image(s) to OpenRouter model ${openrouterModel}`);
+  }
+  const userMessage: { role: string; content: string | Array<{ type: string; text?: string; image_url?: { url: string } }> } =
+    hasInputImages
+      ? {
+          role: "user",
+          content: [
+            { type: "text", text: input.prompt },
+            ...input.images!.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+          ],
+        }
+      : { role: "user", content: input.prompt };
 
   const response = await fetchWithModelTimeout(
-    "https://openrouter.ai/api/v1/chat/completions",
+    OPENROUTER_API_URL,
     {
       method: "POST",
       headers: {
@@ -371,25 +462,19 @@ async function generateOpenRouterResponse(
       body: JSON.stringify({
         store: process.env.OPENROUTER_STORE === "true",
         model: openrouterModel,
-        // Always cap completion tokens. Without this OpenRouter applies the
-        // model's max (>=65k for some models), which (a) often costs more than
-        // a free-tier account can spend in one shot and (b) regularly times
-        // out behind a 100s upstream proxy.
-        max_tokens: codingProjectRequest ? 3000 : 1024,
+        max_tokens: codingProjectRequest ? CODING_MAX_TOKENS : NON_CODING_MAX_TOKENS,
+        ...(hasInputImages ? { provider: { order: ["openai"], allow_fallbacks: true } } : {}),
         messages: [
           {
             role: "system",
-            content: buildSystemPrompt(input, modelText),
+            content: systemPrompt,
           },
           ...history,
-          {
-            role: "user",
-            content: input.prompt,
-          },
+          userMessage,
         ],
       }),
     },
-    codingProjectRequest ? 90_000 : 60_000,
+    mainTimeoutMs,
   );
 
   if (!response.ok) {
@@ -398,21 +483,28 @@ async function generateOpenRouterResponse(
       status: response.status,
       openrouterModel,
       billingModelCode: selectedModel.code,
+      attemptIndex,
     });
     throw new Error(summarizeOpenRouterError(response.status, body, openrouterModel));
   }
 
-  const payload = (await response.json()) as {
+  let payload: {
     choices?: Array<{ message?: { content?: string } }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
     model?: string;
   };
+  try {
+    payload = (await response.json()) as typeof payload;
+  } catch {
+    throw new Error("OpenRouter returned invalid JSON response");
+  }
+
   const rawContent = payload.choices?.[0]?.message?.content?.trim() || "The model returned an empty response.";
   let content = normalizeProjectArtifactContent(rawContent, codingProjectRequest);
 
-  if (codingProjectRequest && !hasUsableProjectArtifact(content, 3)) {
+  if (codingProjectRequest && !hasUsableProjectArtifact(content, 1)) {
     const repairResponse = await fetchWithModelTimeout(
-      "https://openrouter.ai/api/v1/chat/completions",
+      OPENROUTER_API_URL,
       {
         method: "POST",
         headers: {
@@ -424,7 +516,7 @@ async function generateOpenRouterResponse(
         body: JSON.stringify({
           store: process.env.OPENROUTER_STORE === "true",
           model: openrouterModel,
-          max_tokens: 2200,
+          max_tokens: REPAIR_MAX_TOKENS,
           messages: [
             {
               role: "system",
@@ -434,7 +526,7 @@ async function generateOpenRouterResponse(
               role: "user",
               content: [
                 "Rewrite your previous output into exactly one valid pineapple-project artifact.",
-                "Must include at least 3 files: index.html, styles.css, script.js.",
+                "Use file types appropriate for the language/framework the user requested. Do not force HTML/CSS/JS unless that is what the user asked for.",
                 "Every file must be an object with path and content keys.",
                 "Keep content plain text with normal newlines (not escaped JSON strings).",
                 "Output one intro sentence, then one ```pineapple-project fenced block with valid JSON.",
@@ -446,22 +538,27 @@ async function generateOpenRouterResponse(
           ],
         }),
       },
-      75_000,
+      REPAIR_TIMEOUT_MS,
     );
 
     if (repairResponse.ok) {
-      const repairPayload = (await repairResponse.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const repairedRaw = repairPayload.choices?.[0]?.message?.content?.trim();
-      if (repairedRaw) {
-        content = normalizeProjectArtifactContent(repairedRaw, true);
+      try {
+        const repairPayload = (await repairResponse.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        const repairedRaw = repairPayload.choices?.[0]?.message?.content?.trim();
+        if (repairedRaw) {
+          content = normalizeProjectArtifactContent(repairedRaw, true);
+        }
+      } catch {
+        /* keep content from main call */
       }
     }
   }
 
-  if (codingProjectRequest && !hasUsableProjectArtifact(content, 3)) {
-    content = fallbackProjectArtifactContent(input.prompt);
+  if (codingProjectRequest && !hasUsableProjectArtifact(content, 1)) {
+    /* Model responded but didn't produce a valid artifact — keep the raw response
+       so the user can still see the code/text the model generated. */
   }
 
   return {
@@ -472,11 +569,45 @@ async function generateOpenRouterResponse(
     fallbackNotice,
     totalTokens:
       payload.usage?.total_tokens ??
-      (payload.usage?.prompt_tokens ?? 0) +
-        (payload.usage?.completion_tokens ?? 0),
+      (payload.usage?.prompt_tokens ?? 0) + (payload.usage?.completion_tokens ?? 0),
     selectedModelCode: selectedModel.code,
     selectedModelMultiplier: selectedModel.multiplier,
   };
+}
+
+async function generateOpenRouterResponse(
+  input: GenerateInput,
+  modelText: string,
+  fallbackNotice?: string,
+): Promise<GenerateResult> {
+  if (!process.env.OPENROUTER_API_KEY) {
+    throw new Error("OpenRouter is not configured. Set OPENROUTER_API_KEY to generate model responses.");
+  }
+
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < OPENROUTER_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await openRouterSingleAttempt(input, modelText, fallbackNotice, attempt);
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (isOpenRouterCreditExhaustedMessage(lastErr.message)) {
+        throw lastErr;
+      }
+      if (isOpenRouterAuthConfigMessage(lastErr.message)) {
+        throw lastErr;
+      }
+      // Image processing errors are permanent — retrying won't help
+      if (lastErr.message.includes("[image_error]")) {
+        throw lastErr;
+      }
+      logError("OpenRouter attempt failed", lastErr, { attempt, attempts: OPENROUTER_MAX_ATTEMPTS });
+      if (attempt < OPENROUTER_MAX_ATTEMPTS - 1) {
+        await sleep(Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** attempt));
+      }
+    }
+  }
+
+  return guaranteedOpenRouterResult(input, modelText, fallbackNotice, lastErr);
 }
 
 export async function generateAgentResponse(input: GenerateInput): Promise<GenerateResult> {
@@ -501,7 +632,10 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
     };
   }
 
-  if (!FORCE_OPENCODE_ONLY) {
+  const hasImages = input.images && input.images.length > 0;
+
+  // Images require multimodal — OpenCode is text-only, go directly to OpenRouter
+  if (!FORCE_OPENCODE_ONLY || hasImages) {
     return generateOpenRouterResponse(input, modelText);
   }
 
@@ -529,34 +663,45 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
 
     try {
       const baseSystem = `${buildSystemPrompt(input, modelText)}\n\nYou are ${input.agentName}.`;
+      const history = await getConversationHistory(input.userId, input.conversationId);
+      const artifactCtx = extractLastArtifactContext(history);
+      const fullSystem = artifactCtx ? `${baseSystem}\n\n${artifactCtx}` : baseSystem;
+
+      const historyContext = history.length > 0
+        ? history.map((m) => `[${m.role.toUpperCase()}]: ${m.content.slice(0, 3000)}`).slice(-10).join("\n\n")
+        : "";
+      const enrichedPrompt = historyContext
+        ? `[Previous conversation context for continuity]\n${historyContext}\n\n[Current user message]\n${input.prompt}`
+        : input.prompt;
+
       let openCodeResult = await callOpenCode(
-        input.prompt,
-        baseSystem,
-        codingProjectRequest ? 180_000 : 120_000,
+        enrichedPrompt,
+        fullSystem,
+        codingProjectRequest ? 300_000 : 280_000,
         codingProjectRequest ? 3000 : 1024,
       );
 
       if (!openCodeResult?.content?.trim()) {
         openCodeResult = await callOpenCode(
-          input.prompt,
-          `${baseSystem}\n\nReturn plain text response only. Do not emit empty parts.`,
-          codingProjectRequest ? 180_000 : 120_000,
+          enrichedPrompt,
+          `${fullSystem}\n\nReturn plain text response only. Do not emit empty parts.`,
+          codingProjectRequest ? 300_000 : 280_000,
           codingProjectRequest ? 2200 : 900,
         );
       }
 
-      if (codingProjectRequest && openCodeResult?.content && !hasUsableProjectArtifact(openCodeResult.content, 3)) {
+      if (codingProjectRequest && openCodeResult?.content && !hasUsableProjectArtifact(openCodeResult.content, 1)) {
         const repairPrompt = [
           "Rewrite your previous answer as one strict pineapple-project artifact with valid JSON.",
           "Output exactly:",
           "1) one short intro sentence",
           "2) one fenced block tagged pineapple-project",
           "3) valid JSON only inside that block with: {\"name\",\"entry\",\"files\":[{\"path\",\"content\"}]}",
-          "4) include at least 3 files: index.html, styles.css, script.js",
+          "4) use file types and count appropriate for the project — do not force HTML/CSS/JS if the user asked for another language",
           "5) every file object MUST include both path and content keys; content must be plain text with normal newlines",
           "Do not include any other text.",
         ].join("\n");
-        openCodeResult = await callOpenCode(repairPrompt, baseSystem, 150_000, 1800);
+        openCodeResult = await callOpenCode(repairPrompt, fullSystem, 280_000, 1800);
       }
 
       if (openCodeResult) {
@@ -571,10 +716,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
           openCodeResult.content,
           codingProjectRequest,
         );
-        const safeContent =
-          codingProjectRequest && !hasUsableProjectArtifact(normalizedContent, 3)
-            ? fallbackProjectArtifactContent(input.prompt)
-            : normalizedContent;
+        const safeContent = normalizedContent;
         return {
           ...openCodeResult,
           content: safeContent,
@@ -590,19 +732,24 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         billingModelCode: input.billingModelCode,
       });
 
-      // Keep production chat available when OpenCode session execution fails due
-      // upstream provider policy/credit/runtime issues. We preserve the exact
-      // UI-selected model by routing the same request through OpenRouter.
-      if (isOpenCodeProviderFailure(error) && process.env.OPENROUTER_API_KEY) {
+      if (process.env.OPENROUTER_API_KEY) {
         return generateOpenRouterResponse(
           input,
           modelText,
-          "OpenCode execution failed for this request. Routed via direct OpenRouter as fallback.",
+          "OpenCode could not complete this request. Answered via OpenRouter instead.",
         );
       }
 
       throw error instanceof Error ? error : new Error("OpenCode request failed");
     }
+  }
+
+  if (process.env.OPENROUTER_API_KEY) {
+    return generateOpenRouterResponse(
+      input,
+      modelText,
+      "OpenCode was not available for this request. Answered via OpenRouter instead.",
+    );
   }
 
   if (FORCE_OPENCODE_ONLY) {

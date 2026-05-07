@@ -4,7 +4,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm install
 
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app

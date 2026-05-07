@@ -17,11 +17,14 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Clock,
+  Clipboard,
   Coins,
   CreditCard,
   Download,
+  Edit3,
   Eye,
   FileCode2,
   FileText,
@@ -34,8 +37,10 @@ import {
   MicOff,
   Moon,
   Paperclip,
+  Pencil,
   Plug,
   Plus,
+  RefreshCw,
   Rocket,
   Search,
   Send,
@@ -132,6 +137,7 @@ type Message = {
   content: string;
   createdAt: string;
   tokenEstimate?: number;
+  modelUsed?: string;
 };
 
 type ProjectFile = {
@@ -163,6 +169,8 @@ type Task = {
   result: string | null;
   tokenCost: number;
   createdAt: string;
+  conversationId: string | null;
+  agentId: string | null;
   agent: Agent | null;
 };
 
@@ -225,6 +233,7 @@ type SystemLog = {
 };
 
 type AppData = {
+  testingUnlimited?: boolean;
   user: User;
   entitlement: {
     plan: Plan;
@@ -286,7 +295,8 @@ type TabKey =
   | "connectors"
   | "notifications"
   | "request"
-  | "tasks";
+  | "tasks"
+  | "workspace";
 
 type ProfileTabKey = "profile" | "logs" | "billing" | "live";
 
@@ -303,6 +313,7 @@ const sidebarTabs: Array<{
   { key: "myAgents", label: "My Agents", icon: Bot },
   { key: "marketplace", label: "Marketplace", icon: Store },
   { key: "connectors", label: "Connectors", icon: Plug },
+  { key: "workspace", label: "Workspace", icon: Folder },
   { key: "notifications", label: "Notifications", icon: Bell, badge: "notifications" },
   { key: "request", label: "Requests", icon: Inbox, badge: "requests" },
   { key: "tasks", label: "Tasks", icon: Activity },
@@ -471,10 +482,20 @@ function parseJsonObjectSlice(value: string) {
   const end = value.lastIndexOf("}");
   if (start < 0 || end <= start) return null;
 
+  const slice = value.slice(start, end + 1);
   try {
-    return JSON.parse(value.slice(start, end + 1)) as unknown;
+    return JSON.parse(slice) as unknown;
   } catch {
-    return null;
+    // Try fixing common issues: unescaped newlines inside string values
+    try {
+      const fixed = slice
+        .replace(/\r\n/g, "\\n")
+        .replace(/(?<!\\)\n/g, "\\n")
+        .replace(/\t/g, "\\t");
+      return JSON.parse(fixed) as unknown;
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -512,7 +533,7 @@ function normalizeArtifactFileContent(value: string) {
     normalized = normalized.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
   }
 
-  if (normalized.includes("\\\"") && /<html|<!doctype html|<body|<head/i.test(normalized)) {
+  if (normalized.includes("\\\"")) {
     normalized = normalized.replace(/\\"/g, "\"");
   }
 
@@ -544,26 +565,169 @@ function artifactFromUnknown(value: unknown): ProjectArtifact | null {
   return null;
 }
 
+function findMatchingBrace(text: string, startIdx: number): number {
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (ch === "\\" && inString) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function extractArtifactJson(content: string, tagPos: number): { json: string; endPos: number } | null {
+  const braceStart = content.indexOf("{", tagPos);
+  if (braceStart < 0) return null;
+
+  const braceEnd = findMatchingBrace(content, braceStart);
+  if (braceEnd < 0) return null;
+
+  return { json: content.slice(braceStart, braceEnd + 1), endPos: braceEnd + 1 };
+}
+
+function decodeJsonLikeString(raw: string): string {
+  try {
+    return JSON.parse(`"${raw}"`) as string;
+  } catch {
+    try {
+      return JSON.parse(`"${raw.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`) as string;
+    } catch {
+      return raw.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, "\"");
+    }
+  }
+}
+
+function parseTruncatedArtifactBlock(block: string): ProjectArtifact | null {
+  const nameMatch = block.match(/"name"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const entryMatch = block.match(/"entry"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  const filePattern = /\{\s*"path"\s*:\s*"((?:\\.|[^"\\])*)"\s*,\s*"content"\s*:\s*"((?:\\.|[^"\\])*)"\s*\}/g;
+
+  const files: Array<{ path: string; content: string }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = filePattern.exec(block)) !== null) {
+    const path = decodeJsonLikeString(match[1]).trim();
+    const content = normalizeArtifactFileContent(decodeJsonLikeString(match[2]));
+    if (path && content !== undefined) {
+      files.push({ path, content });
+    }
+  }
+
+  if (files.length === 0) return null;
+
+  return normalizeArtifactFiles({
+    name: decodeJsonLikeString(nameMatch?.[1] ?? "Recovered Project Artifact"),
+    entry: entryMatch?.[1] ? decodeJsonLikeString(entryMatch[1]) : files[0].path,
+    files,
+  });
+}
+
+function stripCodeBlocks(text: string): string {
+  return text.replace(/```[\w-]*\n?[\s\S]*?```/g, "").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function cleanIntro(raw: string): string {
+  const stripped = stripCodeBlocks(raw).trim();
+  if (!stripped || stripped.length < 5) return "Here's the complete project structure:";
+  const firstLine = stripped.split("\n")[0].trim();
+  if (firstLine.length > 10) return firstLine;
+  return stripped.slice(0, 200);
+}
+
+function safeParseJson(json: string): unknown {
+  try {
+    return JSON.parse(json);
+  } catch {
+    try {
+      const fixed = json.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+      return JSON.parse(fixed);
+    } catch {
+      return null;
+    }
+  }
+}
+
 function artifactFromText(content: string): { intro: string; artifact: ProjectArtifact | null } {
   const normalized = decodeEscapedContent(content);
-  const fenced = normalized.match(/```(?:pineapple-project|json)?\s*([\s\S]*?)```/);
 
-  if (fenced) {
-    const artifact = artifactFromUnknown(parseJsonObjectSlice(fenced[1]));
-    if (artifact) {
+  // Priority 1: Look specifically for ```pineapple-project blocks, using brace matching
+  const tagIdx = normalized.indexOf("```pineapple-project");
+  if (tagIdx >= 0) {
+    const afterTag = tagIdx + "```pineapple-project".length;
+    const extracted = extractArtifactJson(normalized, afterTag);
+    if (extracted) {
+      const parsed = safeParseJson(extracted.json);
+      const artifact = parsed ? artifactFromUnknown(parsed) : null;
+      if (artifact) {
+        const introRaw = normalized.slice(0, tagIdx);
+        return {
+          intro: cleanIntro(introRaw) || "Here's the complete project structure:",
+          artifact,
+        };
+      }
+    }
+
+    // Fallback for truncated responses where JSON/fence is cut off.
+    const fenceEnd = normalized.indexOf("```", afterTag);
+    const candidateBlock = normalized.slice(afterTag, fenceEnd > -1 ? fenceEnd : normalized.length).trim();
+    const recovered = parseTruncatedArtifactBlock(candidateBlock);
+    if (recovered) {
+      const introRaw = normalized.slice(0, tagIdx);
       return {
-        intro: normalized.replace(fenced[0], "").trim() || "I've created a complete project structure for you.",
-        artifact,
+        intro: cleanIntro(introRaw) || "Recovered a partial project structure from the response:",
+        artifact: recovered,
       };
     }
   }
 
+  // Priority 2: Look for a JSON block tagged as ```json that contains "files" array
+  const jsonTagRegex = /```json\s*/g;
+  let jsonMatch: RegExpExecArray | null;
+  while ((jsonMatch = jsonTagRegex.exec(normalized)) !== null) {
+    const extracted = extractArtifactJson(normalized, jsonMatch.index + jsonMatch[0].length);
+    if (extracted) {
+      const parsed = safeParseJson(extracted.json);
+      const artifact = parsed ? artifactFromUnknown(parsed) : null;
+      if (artifact) {
+        const introRaw = normalized.slice(0, jsonMatch.index);
+        return {
+          intro: cleanIntro(introRaw) || "Here's the complete project structure:",
+          artifact,
+        };
+      }
+    }
+  }
+
+  // Priority 3: Try parsing the entire content as a JSON object with files
   const artifact = artifactFromUnknown(parseJsonObjectSlice(normalized));
   if (!artifact) return { intro: content, artifact: null };
 
   const intro = normalized.slice(0, normalized.indexOf("{")).trim();
   return {
-    intro: intro || "I've created a complete project structure for you.",
+    intro: cleanIntro(intro) || "Here's the complete project structure:",
     artifact,
   };
 }
@@ -582,9 +746,32 @@ function safeProjectName(name: string) {
   );
 }
 
-function buildPreviewHtml(artifact: ProjectArtifact) {
-  const entry = artifact.files.find((file) => file.path === (artifact.entry ?? "index.html")) ?? artifact.files[0];
-  if (!entry) return "";
+function pickPreviewEntry(artifact: ProjectArtifact): ProjectFile | null {
+  const normalizedEntry = (artifact.entry ?? "").replace(/^[./]+/, "").toLowerCase();
+  if (normalizedEntry.endsWith(".html")) {
+    const exact = artifact.files.find((file) => file.path.replace(/^[./]+/, "").toLowerCase() === normalizedEntry);
+    if (exact) return exact;
+  }
+
+  const preferred = [
+    "index.html",
+    "public/index.html",
+    "frontend/index.html",
+    "frontend/public/index.html",
+    "client/index.html",
+    "client/public/index.html",
+  ];
+  for (const candidate of preferred) {
+    const found = artifact.files.find((file) => file.path.replace(/^[./]+/, "").toLowerCase() === candidate);
+    if (found) return found;
+  }
+
+  return artifact.files.find((file) => file.path.toLowerCase().endsWith(".html")) ?? null;
+}
+
+function buildPreviewHtml(artifact: ProjectArtifact): string | null {
+  const entry = pickPreviewEntry(artifact);
+  if (!entry) return null;
   let html = entry.content;
   const escapeForRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -756,6 +943,13 @@ function DashboardInner() {
   const [deployConfirmOpen, setDeployConfirmOpen] = useState(false);
   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
   const [rejectConfirm, setRejectConfirm] = useState<{ id: string } | null>(null);
+  const [sessionRenameOpen, setSessionRenameOpen] = useState(false);
+  const [sessionRenameDraft, setSessionRenameDraft] = useState("");
+  const [sessionRenameBusy, setSessionRenameBusy] = useState(false);
+  const [sessionManageOpen, setSessionManageOpen] = useState(false);
+  const [sessionDeleteOpen, setSessionDeleteOpen] = useState(false);
+  const [sessionDeleteBusy, setSessionDeleteBusy] = useState(false);
+  const [sessionDeleteTargetId, setSessionDeleteTargetId] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const speechRecognitionRef = useRef<unknown>(null);
@@ -766,9 +960,12 @@ function DashboardInner() {
   const modelSyncInFlightRef = useRef(false);
   const pendingTaskToConversationRef = useRef<Record<string, string>>({});
 
-  const allowedMaxMultiplier = data?.entitlement?.plan?.code
-    ? getAllowedMaxMultiplier(data.entitlement.plan.code)
-    : Number.POSITIVE_INFINITY;
+  const allowedMaxMultiplier =
+    data?.testingUnlimited === true
+      ? 999
+      : data?.entitlement?.plan?.code
+        ? getAllowedMaxMultiplier(data.entitlement.plan.code)
+        : Number.POSITIVE_INFINITY;
   const selectedAllowed =
     typeof allowedMaxMultiplier === "number" && selectedBillingModel.multiplier <= allowedMaxMultiplier;
 
@@ -822,6 +1019,15 @@ function DashboardInner() {
     window.addEventListener("mousedown", handler);
     return () => window.removeEventListener("mousedown", handler);
   }, [modelMenuOpen]);
+
+  useEffect(() => {
+    if (!sessionRenameOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !sessionRenameBusy) setSessionRenameOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sessionRenameOpen, sessionRenameBusy]);
 
   /* ==== API ==== */
 
@@ -963,10 +1169,41 @@ function DashboardInner() {
       speechRecognitionRef.current = null;
     }
 
-    const attachmentLines = attachments.map((a) => `- ${a.name} (${formatBytes(a.size)})`);
+    const allAttachmentLines = attachments.map((a) => `- ${a.name} (${formatBytes(a.size)})`);
+
+    // Read image attachments as base64 data URLs for multimodal model input
+    const imageDataUrls: string[] = [];
+    for (const a of attachments) {
+      if (a.mime.startsWith("image/")) {
+        try {
+          const dataUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(new Error("Failed to read file"));
+            reader.readAsDataURL(a.file);
+          });
+          if (dataUrl && dataUrl.startsWith("data:")) {
+            imageDataUrls.push(dataUrl);
+          }
+        } catch {
+          console.warn("Failed to read image as base64:", a.name);
+        }
+      }
+    }
+
+    const nonImageAttachments = attachments.filter((a) => !a.mime.startsWith("image/"));
+    const nonImageLines = nonImageAttachments.map((a) => `- ${a.name} (${formatBytes(a.size)})`);
+
+    // Prompt sent to model: only includes non-image file names (images are sent as data URLs)
     const promptPayload =
-      attachmentLines.length > 0
-        ? `${prompt.trim()}\n\nAttached files:\n${attachmentLines.join("\n")}`
+      nonImageLines.length > 0
+        ? `${prompt.trim()}\n\nAttached files:\n${nonImageLines.join("\n")}`
+        : prompt.trim();
+
+    // Display text for the user bubble: shows all attachment names
+    const displayPayload =
+      allAttachmentLines.length > 0
+        ? `${prompt.trim()}\n\nAttached files:\n${allAttachmentLines.join("\n")}`
         : prompt.trim();
 
     setChatBusy(true);
@@ -1004,6 +1241,7 @@ function DashboardInner() {
           agentId: selectedAgentId || undefined,
           conversationId: activeConversationId || undefined,
           modelCode: selectedModelCode,
+          images: imageDataUrls.length > 0 ? imageDataUrls : undefined,
         }),
       });
 
@@ -1044,7 +1282,7 @@ function DashboardInner() {
             {
               id: `pending-user-${Date.now()}`,
               role: "USER",
-              content: promptPayload,
+              content: displayPayload,
               createdAt: nowIso,
             },
             {
@@ -1078,6 +1316,31 @@ function DashboardInner() {
           ? error.message
           : "We could not reach the server. Check your internet connection and try again.";
       toast.show({ tone: "danger", title: "Network error", body: message });
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function retryTask(task: Task) {
+    if (chatBusy) return;
+    setChatBusy(true);
+    try {
+      const response = await fetch("/api/chat/retry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: task.id,
+          modelCode: selectedModelCode,
+        }),
+      });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Retry failed", body: await readApiError(response) });
+        return;
+      }
+      toast.show({ tone: "info", title: "Retrying", body: "Re-executing the task from scratch." });
+      await loadData();
+    } catch {
+      toast.show({ tone: "danger", title: "Network error", body: "Could not reach the server." });
     } finally {
       setChatBusy(false);
     }
@@ -1203,6 +1466,93 @@ function DashboardInner() {
     };
     speechRecognitionRef.current = recognition;
     recognition.start();
+  }
+
+  async function confirmSessionRename() {
+    const title = sessionRenameDraft.trim();
+    if (!title || !conversationId) return;
+    setSessionRenameBusy(true);
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Could not rename session", body: await readApiError(response) });
+        return;
+      }
+      setSessionRenameOpen(false);
+      toast.show({ tone: "success", title: "Session renamed" });
+      await loadData();
+    } finally {
+      setSessionRenameBusy(false);
+    }
+  }
+
+  function openSessionRenameModal() {
+    if (!conversationId || !data) return;
+    const current = data.conversations.find((c) => c.id === conversationId);
+    if (!current) return;
+    setSessionRenameDraft(current.title);
+    setSessionRenameOpen(true);
+  }
+
+  function openSessionDeleteModal() {
+    if (!conversationId) return;
+    setSessionDeleteTargetId(conversationId);
+    setSessionDeleteOpen(true);
+  }
+
+  function requestSessionDelete(targetId: string) {
+    setSessionDeleteTargetId(targetId);
+    setSessionDeleteOpen(true);
+  }
+
+  async function confirmSessionDelete() {
+    if (!sessionDeleteTargetId || !data) return;
+    setSessionDeleteBusy(true);
+    try {
+      const deletingId = sessionDeleteTargetId;
+      const response = await fetch(`/api/conversations/${deletingId}`, { method: "DELETE" });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Could not delete session", body: await readApiError(response) });
+        return;
+      }
+
+      const remaining = data.conversations.filter((c) => c.id !== deletingId);
+      setSessionDeleteOpen(false);
+      setSessionDeleteTargetId(null);
+      setData((prev) => (prev ? { ...prev, conversations: remaining } : prev));
+      if (conversationId === deletingId) {
+        setConversationId(remaining[0]?.id ?? "");
+      }
+      if (remaining.length === 0) {
+        setSessionManageOpen(false);
+      }
+      toast.show({ tone: "success", title: "Session deleted permanently" });
+    } finally {
+      setSessionDeleteBusy(false);
+    }
+  }
+
+  async function exportConversation(convId: string) {
+    try {
+      const response = await fetch("/api/conversations/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conversationId: convId, format: "docx" }),
+      });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Export failed", body: await readApiError(response) });
+        return;
+      }
+      const blob = await response.blob();
+      downloadBlob(blob, `conversation-${convId.slice(0, 8)}.docx`);
+      toast.show({ tone: "success", title: "Exported", body: "Your conversation has been downloaded." });
+    } catch {
+      toast.show({ tone: "danger", title: "Export error", body: "Could not export the conversation." });
+    }
   }
 
   async function createConversation() {
@@ -1491,14 +1841,21 @@ function DashboardInner() {
       }
     : selectedConversation;
   const pendingApprovals = data.approvals.filter((a) => a.status === "PENDING");
+  const testingUnlimited = data.testingUnlimited === true;
   const monthlyCap = data.entitlement.plan.monthlyTokens;
   const subRem = data.wallet?.subscriptionTokensRemaining ?? 0;
   const purRem = data.wallet?.purchasedTokensRemaining ?? 0;
-  const usedSub = monthlyCap > 0 ? Math.max(0, monthlyCap - subRem) : 0;
-  const tokenBarPct = monthlyCap > 0 ? Math.min(100, (usedSub / monthlyCap) * 100) : 0;
-  const capLabel = monthlyCap > 0 ? formatTokenShort(monthlyCap) : "∞";
-  const lowFuel = monthlyCap > 0 && subRem / monthlyCap < 0.1;
-  const maxAgentSlots = data.entitlement.plan.maxAgents >= 999 ? 99 : data.entitlement.plan.maxAgents;
+  const usedSub =
+    testingUnlimited ? 0 : monthlyCap > 0 ? Math.max(0, monthlyCap - subRem) : 0;
+  const tokenBarPct =
+    testingUnlimited ? 0 : monthlyCap > 0 ? Math.min(100, (usedSub / monthlyCap) * 100) : 0;
+  const capLabel = testingUnlimited ? "∞" : monthlyCap > 0 ? formatTokenShort(monthlyCap) : "∞";
+  const lowFuel = !testingUnlimited && monthlyCap > 0 && subRem / monthlyCap < 0.1;
+  const maxAgentSlots = testingUnlimited
+    ? 99
+    : data.entitlement.plan.maxAgents >= 999
+      ? 99
+      : data.entitlement.plan.maxAgents;
   const freeSlots = Math.max(0, maxAgentSlots - deployedAgents.length);
 
   const planBadge =
@@ -1627,7 +1984,7 @@ function DashboardInner() {
               </span>
             </div>
             <div className="token-meter-bar" aria-hidden>
-              {monthlyCap > 0 ? (
+              {monthlyCap > 0 && !testingUnlimited ? (
                 <div className="token-meter-fill" style={{ width: `${tokenBarPct}%` }} />
               ) : (
                 <div className="token-meter-fill" style={{ width: "100%", opacity: 0.6 }} />
@@ -1711,6 +2068,45 @@ function DashboardInner() {
                 ))}
               </select>
               <ChevronDown size={14} style={{ color: "var(--muted)" }} />
+              <button
+                type="button"
+                className="session-rename-btn"
+                title="Manage sessions"
+                aria-label="Manage sessions"
+                onClick={() => setSessionManageOpen(true)}
+              >
+                <Settings size={14} />
+              </button>
+              <button
+                type="button"
+                className="session-rename-btn"
+                title="Rename session"
+                aria-label="Rename session"
+                disabled={!conversationId}
+                onClick={() => openSessionRenameModal()}
+              >
+                <Pencil size={14} />
+              </button>
+              <button
+                type="button"
+                className="session-rename-btn"
+                title="Export conversation"
+                aria-label="Export conversation"
+                disabled={!conversationId}
+                onClick={() => exportConversation(conversationId!)}
+              >
+                <Download size={14} />
+              </button>
+              <button
+                type="button"
+                className="session-rename-btn"
+                title="Delete session"
+                aria-label="Delete session"
+                disabled={!conversationId}
+                onClick={() => openSessionDeleteModal()}
+              >
+                <Trash2 size={14} />
+              </button>
             </div>
             <span className="live-pill">Live</span>
             <div style={{ flex: 1 }} />
@@ -1752,6 +2148,8 @@ function DashboardInner() {
                   ? "Approval Requests"
                   : activeTab === "tasks"
                   ? "Tasks"
+                  : activeTab === "workspace"
+                  ? "Workspace"
                   : ""}
               </h1>
               <p className="page-subtitle">
@@ -1775,6 +2173,7 @@ function DashboardInner() {
                 )}
                 {profileTab === null && activeTab === "request" && "Review and approve high-risk agent actions."}
                 {profileTab === null && activeTab === "tasks" && "Track every task your agents have run."}
+                {profileTab === null && activeTab === "workspace" && "Your persistent file workspace. Files are saved across sessions."}
               </p>
             </div>
             <HeaderRight
@@ -1790,6 +2189,14 @@ function DashboardInner() {
         )}
 
         {/* ============ Content ============ */}
+
+        {!showAdmin && data.testingUnlimited === true && (
+          <div className="notice" style={{ margin: "0 24px 16px", borderColor: "var(--accent)", fontSize: "0.9rem" }}>
+            <strong>Testing mode</strong> — token debits and usage caps are disabled (
+            <code style={{ fontSize: "0.85em" }}>TESTING_UNLIMITED=true</code> on the server). Marketplace cards still show
+            catalog copy from the database; your effective budget is unlimited for API checks.
+          </div>
+        )}
 
         {/* Admin users render an entirely separate console (handled above). */}
 
@@ -1910,7 +2317,31 @@ function DashboardInner() {
         )}
 
         {!showAdmin && profileTab === null && activeTab === "tasks" && (
-          <TasksTab tasks={data.tasks} stats={taskStats} />
+          <TasksTab
+            tasks={data.tasks}
+            stats={taskStats}
+            onRetry={(task) => retryTask(task)}
+            onOpenTaskInChat={(task) => {
+              if (!task.conversationId) {
+                toast.show({
+                  tone: "warning",
+                  title: "No linked chat",
+                  body: "This task is not tied to a chat session.",
+                });
+                return;
+              }
+              const fromTask = task.agentId ?? task.agent?.id ?? null;
+              const fromConversation = data.conversations.find((c) => c.id === task.conversationId)?.agent?.id ?? null;
+              const nextAgentId = fromTask ?? fromConversation;
+              if (nextAgentId) setSelectedAgentId(nextAgentId);
+              setConversationId(task.conversationId);
+              setActiveTab("chat");
+            }}
+          />
+        )}
+
+        {!showAdmin && profileTab === null && activeTab === "workspace" && (
+          <WorkspaceTab />
         )}
       </section>
 
@@ -1957,6 +2388,118 @@ function DashboardInner() {
         onConfirm={performLogout}
         onCancel={() => setLogoutConfirmOpen(false)}
       />
+
+      {sessionRenameOpen && (
+        <div className="modal-backdrop" onClick={() => !sessionRenameBusy && setSessionRenameOpen(false)}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-icon-wrap info">
+              <Pencil size={22} />
+            </div>
+            <h3>Rename session</h3>
+            <p className="fine-print" style={{ marginTop: 8 }}>
+              Choose a clear name so you can tell sessions apart in the list.
+            </p>
+            <label className="modal-field-label" htmlFor="session-rename-input">
+              Session name
+            </label>
+            <input
+              id="session-rename-input"
+              className="modal-field-input"
+              value={sessionRenameDraft}
+              onChange={(event) => setSessionRenameDraft(event.target.value)}
+              maxLength={120}
+              autoComplete="off"
+              autoFocus
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !sessionRenameBusy && sessionRenameDraft.trim()) {
+                  event.preventDefault();
+                  void confirmSessionRename();
+                }
+              }}
+            />
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn btn-ghost"
+                onClick={() => !sessionRenameBusy && setSessionRenameOpen(false)}
+                disabled={sessionRenameBusy}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => void confirmSessionRename()}
+                disabled={sessionRenameBusy || !sessionRenameDraft.trim()}
+              >
+                {sessionRenameBusy ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmModal
+        open={sessionDeleteOpen}
+        title="Delete session permanently?"
+        description="Are you sure you want to permanently delete the session? This action cannot be undone."
+        confirmLabel="Delete session"
+        cancelLabel="Cancel"
+        tone="danger"
+        loading={sessionDeleteBusy}
+        onConfirm={() => void confirmSessionDelete()}
+        onCancel={() => {
+          if (sessionDeleteBusy) return;
+          setSessionDeleteOpen(false);
+          setSessionDeleteTargetId(null);
+        }}
+      />
+
+      {sessionManageOpen && (
+        <div className="modal-backdrop" onClick={() => setSessionManageOpen(false)}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-icon-wrap info">
+              <Settings size={22} />
+            </div>
+            <h3>Manage sessions</h3>
+            <p className="fine-print" style={{ marginTop: 8 }}>
+              Select a session or delete it permanently.
+            </p>
+            <div className="session-manage-list">
+              {data.conversations.length === 0 && <p className="fine-print">No sessions available.</p>}
+              {data.conversations.map((session) => (
+                <div key={session.id} className={clsx("session-manage-row", session.id === conversationId && "active")}>
+                  <button
+                    type="button"
+                    className="session-manage-select"
+                    onClick={() => {
+                      setConversationId(session.id);
+                      setSessionManageOpen(false);
+                    }}
+                  >
+                    <span className="session-manage-title">{session.title}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="session-manage-delete"
+                    onClick={() => requestSessionDelete(session.id)}
+                    title="Delete session permanently"
+                    aria-label={`Delete session ${session.title}`}
+                    disabled={sessionDeleteBusy}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="btn btn-ghost" onClick={() => setSessionManageOpen(false)}>
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <ConfirmModal
         open={Boolean(rejectConfirm)}
@@ -2106,19 +2649,43 @@ function ChatTab(props: {
           )}
           {selectedConversation?.messages.map((item) => {
             const parsed = item.role === "ASSISTANT" ? parseProjectArtifact(item.content) : null;
+            const isErrorResponse = item.role === "ASSISTANT" && isModelProviderErrorMessage(item.content);
             return (
               <article
                 key={item.id}
                 className={clsx("bubble", item.role.toLowerCase(), parsed?.artifact && "project-bubble")}
               >
-                <span>{item.role === "ASSISTANT" ? "PineApple" : item.role}</span>
+                <span>{item.role === "ASSISTANT" ? "PineApple" : "You"}</span>
                 {parsed?.artifact ? (
                   <ProjectArtifactCard intro={parsed.intro} artifact={parsed.artifact} />
                 ) : (
-                  <p>{item.content}</p>
+                  renderMessageContent(item.content)
+                )}
+                {isErrorResponse && (
+                  <button
+                    type="button"
+                    className="task-retry-btn"
+                    style={{ marginTop: 10 }}
+                    onClick={() => {
+                      const userMsg = selectedConversation?.messages
+                        .slice(0, selectedConversation.messages.indexOf(item))
+                        .filter((m) => m.role === "USER")
+                        .pop();
+                      if (userMsg) {
+                        const retryPrompt = userMsg.content.split("\n\nAttached files:")[0];
+                        setPrompt(retryPrompt);
+                        setTimeout(() => {
+                          const form = document.querySelector("form");
+                          if (form) form.requestSubmit();
+                        }, 100);
+                      }
+                    }}
+                  >
+                    <RefreshCw size={13} /> Retry
+                  </button>
                 )}
                 {item.role === "ASSISTANT" && typeof item.tokenEstimate === "number" && item.tokenEstimate > 0 && (
-                  <small>Tokens: {formatNumber(item.tokenEstimate)}</small>
+                  <small>Tokens: {formatNumber(item.tokenEstimate)}{item.modelUsed ? ` · ${item.modelUsed}` : ""}</small>
                 )}
               </article>
             );
@@ -2259,7 +2826,7 @@ function ChatTab(props: {
             </div>
           </div>
           <p className="chat-disclaimer">
-            PineApple may make mistakes. Verify important information. Drag files anywhere on the chat to attach.
+            PineApple may make mistakes. Verify important information. Web access &amp; search are not available yet. Drag files anywhere on the chat to attach.
           </p>
         </form>
       </div>
@@ -2267,30 +2834,187 @@ function ChatTab(props: {
   );
 }
 
+/* ============================ Code Block with Copy ============================ */
+
+function CodeBlock({ code, language }: { code: string; language?: string }) {
+  const [copied, setCopied] = useState(false);
+  function copy() {
+    navigator.clipboard.writeText(code).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+  return (
+    <div className="code-block-wrapper">
+      <div className="code-block-header">
+        <span className="code-block-lang">{language || "code"}</span>
+        <button type="button" className="code-block-copy" onClick={copy}>
+          {copied ? <><Check size={13} /> Copied</> : <><Clipboard size={13} /> Copy</>}
+        </button>
+      </div>
+      <pre className="code-block-pre"><code>{code}</code></pre>
+    </div>
+  );
+}
+
+function renderMessageContent(content: string) {
+  const parts: Array<{ type: "text"; text: string } | { type: "code"; code: string; lang: string }> = [];
+  const codeBlockRegex = /```(\w*)\n?([\s\S]*?)```/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = codeBlockRegex.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push({ type: "text", text: content.slice(lastIndex, match.index) });
+    }
+    parts.push({ type: "code", code: match[2].trimEnd(), lang: match[1] || "" });
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex < content.length) {
+    parts.push({ type: "text", text: content.slice(lastIndex) });
+  }
+  if (parts.length === 0) return <p>{content}</p>;
+  if (parts.length === 1 && parts[0].type === "text") return <p>{parts[0].text}</p>;
+  return (
+    <div className="message-rich-content">
+      {parts.map((part, i) =>
+        part.type === "code" ? (
+          <CodeBlock key={i} code={part.code} language={part.lang} />
+        ) : (
+          <p key={i}>{part.text}</p>
+        )
+      )}
+    </div>
+  );
+}
+
 function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: ProjectArtifact }) {
   const [activePath, setActivePath] = useState(artifact.entry ?? artifact.files[0]?.path ?? "");
-  const activeFile = artifact.files.find((file) => file.path === activePath) ?? artifact.files[0];
-  const folders = useMemo(() => {
-    const names = new Set<string>();
+  const [editedFiles, setEditedFiles] = useState<Record<string, string>>({});
+  const [editingPath, setEditingPath] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
+    const initial = new Set<string>();
     for (const file of artifact.files) {
       const parts = file.path.split("/");
-      for (let i = 1; i < parts.length; i += 1) {
-        names.add(parts.slice(0, i).join("/"));
+      if (parts.length > 1) initial.add(parts[0]);
+    }
+    return initial;
+  });
+
+  const activeFile = artifact.files.find((file) => file.path === activePath) ?? artifact.files[0];
+  const activeContent = activeFile ? (editedFiles[activeFile.path] ?? activeFile.content) : "";
+
+  const fileTree = useMemo(() => {
+    type TreeNode = { name: string; path: string; isFolder: boolean; children: TreeNode[] };
+    const root: TreeNode = { name: "", path: "", isFolder: true, children: [] };
+
+    for (const file of artifact.files) {
+      const parts = file.path.split("/");
+      let current = root;
+      for (let i = 0; i < parts.length; i++) {
+        const isLast = i === parts.length - 1;
+        const partPath = parts.slice(0, i + 1).join("/");
+        let existing = current.children.find((c) => c.path === partPath);
+        if (!existing) {
+          existing = { name: parts[i], path: partPath, isFolder: !isLast, children: [] };
+          current.children.push(existing);
+        }
+        current = existing;
       }
     }
-    return names;
+
+    function sortTree(node: TreeNode) {
+      node.children.sort((a, b) => {
+        if (a.isFolder && !b.isFolder) return -1;
+        if (!a.isFolder && b.isFolder) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      node.children.forEach(sortTree);
+    }
+    sortTree(root);
+    return root.children;
   }, [artifact.files]);
 
+  const liveArtifact = useMemo(() => ({
+    ...artifact,
+    files: artifact.files.map((f) => ({ ...f, content: editedFiles[f.path] ?? f.content })),
+  }), [artifact, editedFiles]);
+  const previewHtml = useMemo(() => buildPreviewHtml(liveArtifact), [liveArtifact]);
+  const canPreview = Boolean(previewHtml);
+
+  function toggleFolder(path: string) {
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }
+
   function preview() {
-    const html = buildPreviewHtml(artifact);
-    const blob = new Blob([html], { type: "text/html" });
+    if (!previewHtml) return;
+    const blob = new Blob([previewHtml], { type: "text/html" });
     const url = URL.createObjectURL(blob);
     window.open(url, "_blank", "noopener,noreferrer");
     window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
   }
 
   function downloadZip() {
-    downloadBlob(createZipBlob(artifact.files), `${safeProjectName(artifact.name)}.zip`);
+    downloadBlob(createZipBlob(liveArtifact.files), `${safeProjectName(artifact.name)}.zip`);
+  }
+
+  function copyFileContent() {
+    navigator.clipboard.writeText(activeContent).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  }
+
+  function startEditing() {
+    if (activeFile) setEditingPath(activeFile.path);
+  }
+
+  function saveEdit(newContent: string) {
+    if (editingPath) {
+      setEditedFiles((prev) => ({ ...prev, [editingPath]: newContent }));
+    }
+    setEditingPath(null);
+  }
+
+  type TreeNodeType = { name: string; path: string; isFolder: boolean; children: TreeNodeType[] };
+
+  function renderTreeNode(node: TreeNodeType, depth: number) {
+    if (node.isFolder) {
+      const isExpanded = expandedFolders.has(node.path);
+      return (
+        <div key={node.path}>
+          <button
+            type="button"
+            className="project-tree-folder"
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
+            onClick={() => toggleFolder(node.path)}
+          >
+            <ChevronRight size={12} className={`tree-chevron ${isExpanded ? "expanded" : ""}`} />
+            <Folder size={14} />
+            <span>{node.name}</span>
+          </button>
+          {isExpanded && node.children.map((child) => renderTreeNode(child, depth + 1))}
+        </div>
+      );
+    }
+    return (
+      <button
+        type="button"
+        key={node.path}
+        className={clsx("project-tree-file", node.path === activeFile?.path && "active")}
+        style={{ paddingLeft: `${8 + depth * 14}px` }}
+        onClick={() => { setActivePath(node.path); setEditingPath(null); }}
+      >
+        <FileCode2 size={14} />
+        <span>{node.name}</span>
+        {editedFiles[node.path] !== undefined && <span className="file-edited-dot" />}
+      </button>
+    );
   }
 
   return (
@@ -2303,7 +3027,20 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
             <span>{artifact.files.length} files</span>
           </div>
           <div className="project-actions">
-            <button type="button" className="project-action-btn" onClick={preview}>
+            <button type="button" className="project-action-btn" onClick={copyFileContent} title="Copy current file">
+              {copied ? <><Check size={14} /> Copied</> : <><Clipboard size={14} /> Copy</>}
+            </button>
+            <button
+              type="button"
+              className="project-action-btn"
+              onClick={preview}
+              disabled={!canPreview}
+              title={
+                canPreview
+                  ? "Preview"
+                  : "Preview unavailable: this project has no browser HTML entry (likely backend/server-only)."
+              }
+            >
               <Eye size={15} /> Preview
             </button>
             <button type="button" className="project-action-btn primary" onClick={downloadZip}>
@@ -2311,25 +3048,14 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
             </button>
           </div>
         </div>
+        {!canPreview && (
+          <p className="project-artifact-intro">
+            Preview unavailable for this artifact because it requires a server/runtime. Download the ZIP to run locally.
+          </p>
+        )}
         <div className="project-body">
           <aside className="project-tree">
-            {[...folders].sort().map((folder) => (
-              <div key={folder} className="project-tree-folder">
-                <Folder size={14} />
-                <span>{folder}</span>
-              </div>
-            ))}
-            {artifact.files.map((file) => (
-              <button
-                type="button"
-                key={file.path}
-                className={clsx("project-tree-file", file.path === activeFile?.path && "active")}
-                onClick={() => setActivePath(file.path)}
-              >
-                <FileCode2 size={14} />
-                <span>{file.path}</span>
-              </button>
-            ))}
+            {fileTree.map((node) => renderTreeNode(node, 0))}
           </aside>
           <section className="project-code-panel">
             {activeFile ? (
@@ -2337,14 +3063,49 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
                 <div className="project-code-head">
                   <FileText size={14} />
                   <strong>{activeFile.path}</strong>
+                  <div className="project-file-actions">
+                    <button type="button" className="pf-action-btn" onClick={copyFileContent} title="Copy file content">
+                      {copied ? <Check size={13} /> : <Clipboard size={13} />}
+                    </button>
+                    <button type="button" className="pf-action-btn" onClick={startEditing} title="Edit file">
+                      <Edit3 size={13} />
+                    </button>
+                  </div>
                 </div>
-                <pre>{activeFile.content}</pre>
+                {editingPath === activeFile.path ? (
+                  <FileEditor content={activeContent} onSave={saveEdit} onCancel={() => setEditingPath(null)} />
+                ) : (
+                  <pre>{activeContent}</pre>
+                )}
               </>
             ) : (
               <div className="project-empty">No content</div>
             )}
           </section>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function FileEditor({ content, onSave, onCancel }: { content: string; onSave: (v: string) => void; onCancel: () => void }) {
+  const [value, setValue] = useState(content);
+  return (
+    <div className="file-editor">
+      <textarea
+        className="file-editor-textarea"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        spellCheck={false}
+        autoFocus
+      />
+      <div className="file-editor-actions">
+        <button type="button" className="project-action-btn primary" onClick={() => onSave(value)}>
+          <Check size={14} /> Save
+        </button>
+        <button type="button" className="project-action-btn" onClick={onCancel}>
+          <X size={14} /> Cancel
+        </button>
       </div>
     </div>
   );
@@ -2527,7 +3288,15 @@ function MarketplaceTab(props: {
                 <div className="plan-feature">
                   <Check size={14} className="check" />
                   <span>
-                    <strong>{formatNumber(plan.monthlyTokens)}</strong> monthly tokens
+                    {data.testingUnlimited === true && isCurrent ? (
+                      <>
+                        <strong>Unlimited</strong> tokens <span className="fine-print">(testing mode)</span>
+                      </>
+                    ) : (
+                      <>
+                        <strong>{formatNumber(plan.monthlyTokens)}</strong> monthly tokens
+                      </>
+                    )}
                   </span>
                 </div>
                 <div className="plan-feature">
@@ -2567,8 +3336,14 @@ function MarketplaceTab(props: {
             <div>
               <h2>Token balance</h2>
               <p className="fine-print">
-                {formatTokenShort(usedSub)} used of {monthlyCap > 0 ? formatTokenShort(monthlyCap) : "plan total"} — used{" "}
-                {Math.round(tokenBarPct)}% this period
+                {data.testingUnlimited === true ? (
+                  <>Testing mode: caps disabled — sidebar meter uses ∞; wallet totals are not reduced when you chat.</>
+                ) : (
+                  <>
+                    {formatTokenShort(usedSub)} used of {monthlyCap > 0 ? formatTokenShort(monthlyCap) : "plan total"} — used{" "}
+                    {Math.round(tokenBarPct)}% this period
+                  </>
+                )}
               </p>
               <div className="token-meter token-balance-bar">
                 <div className="token-meter-bar">
@@ -2828,12 +3603,14 @@ function RequestsTab({
 function TasksTab({
   tasks,
   stats,
+  onOpenTaskInChat,
+  onRetry,
 }: {
   tasks: Task[];
   stats: { total: number; completed: number; pendingExec: number; needApproval: number; rejected: number };
+  onOpenTaskInChat?: (task: Task) => void;
+  onRetry?: (task: Task) => void;
 }) {
-  const [expandedTaskId, setExpandedTaskId] = useState<string | null>(tasks[0]?.id ?? null);
-
   return (
     <section>
       <div className="task-stat-row">
@@ -2858,6 +3635,10 @@ function TasksTab({
           <strong>{stats.rejected}</strong>
         </div>
       </div>
+      <p className="fine-print" style={{ margin: "0 0 14px" }}>
+        Tasks linked to a chat session open that conversation when you select a row. Failed runs show the server error
+        below the prompt (the profile Logs view does not include model failures).
+      </p>
       <div className="workspace-card" style={{ padding: 0, overflow: "hidden" }}>
         <table className="task-table">
           <thead>
@@ -2879,7 +3660,19 @@ function TasksTab({
               </tr>
             )}
             {tasks.map((task) => (
-              <tr key={task.id}>
+              <tr
+                key={task.id}
+                className={task.conversationId ? "task-row-linked" : undefined}
+                tabIndex={task.conversationId ? 0 : undefined}
+                onClick={() => task.conversationId && onOpenTaskInChat?.(task)}
+                onKeyDown={(event) => {
+                  if (!task.conversationId || !onOpenTaskInChat) return;
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    onOpenTaskInChat(task);
+                  }
+                }}
+              >
                 <td>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <div className="agent-icon" style={{ width: 30, height: 30, fontSize: "0.7rem" }}>
@@ -2896,6 +3689,24 @@ function TasksTab({
                   <span className="fine-print">
                     {formatNumber(task.tokenCost)} tokens · {task.actionType}
                   </span>
+                  {(task.status === "FAILED" || task.status === "REJECTED") && task.result ? (
+                    <span
+                      className="fine-print task-fail-reason"
+                      title={task.result}
+                      style={{ display: "block", marginTop: 8 }}
+                    >
+                      {task.result.length > 280 ? `${task.result.slice(0, 280)}…` : task.result}
+                    </span>
+                  ) : null}
+                  {task.status === "FAILED" && onRetry && (
+                    <button
+                      type="button"
+                      className="task-retry-btn"
+                      onClick={(e) => { e.stopPropagation(); onRetry(task); }}
+                    >
+                      <RefreshCw size={13} /> Retry
+                    </button>
+                  )}
                 </td>
                 <td>
                   <span className={statusBadgeClass(task.status)}>{task.status.replaceAll("_", " ")}</span>
@@ -2912,6 +3723,146 @@ function TasksTab({
         </table>
       </div>
     </section>
+  );
+}
+
+/* ============================ Workspace Tab ============================ */
+
+type WorkspaceFile = { id: string; path: string; mimeType: string; sizeBytes: number; updatedAt: string };
+
+function WorkspaceTab() {
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [selectedFile, setSelectedFile] = useState<{ path: string; content: string } | null>(null);
+  const [newFileName, setNewFileName] = useState("");
+  const [newFileContent, setNewFileContent] = useState("");
+  const [showNewFile, setShowNewFile] = useState(false);
+
+  useEffect(() => {
+    loadFiles();
+  }, []);
+
+  async function loadFiles() {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/workspace");
+      if (res.ok) {
+        const data = await res.json();
+        setFiles(data.files ?? []);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openFile(path: string) {
+    const res = await fetch("/api/workspace/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setSelectedFile({ path: data.file.path, content: data.file.content });
+    }
+  }
+
+  async function createFile() {
+    if (!newFileName.trim()) return;
+    await fetch("/api/workspace", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: newFileName.trim(), content: newFileContent }),
+    });
+    setNewFileName("");
+    setNewFileContent("");
+    setShowNewFile(false);
+    await loadFiles();
+  }
+
+  async function deleteFile(path: string) {
+    await fetch("/api/workspace", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    if (selectedFile?.path === path) setSelectedFile(null);
+    await loadFiles();
+  }
+
+  if (loading) return <div className="tab-empty-state"><p>Loading workspace…</p></div>;
+
+  return (
+    <div className="workspace-panel">
+      <div className="workspace-toolbar">
+        <button type="button" className="btn btn-primary btn-sm" onClick={() => setShowNewFile(!showNewFile)}>
+          + New File
+        </button>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={loadFiles}>
+          Refresh
+        </button>
+      </div>
+
+      {showNewFile && (
+        <div className="workspace-new-file">
+          <input
+            placeholder="File path (e.g. src/index.js)"
+            value={newFileName}
+            onChange={(e) => setNewFileName(e.target.value)}
+            className="modal-field-input"
+          />
+          <textarea
+            placeholder="File content (optional)"
+            value={newFileContent}
+            onChange={(e) => setNewFileContent(e.target.value)}
+            className="file-editor-textarea"
+            rows={4}
+          />
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={createFile} disabled={!newFileName.trim()}>
+              Create
+            </button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setShowNewFile(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="workspace-layout">
+        <div className="workspace-file-list">
+          {files.length === 0 && <p className="tab-empty-hint">No files yet. Create your first file above.</p>}
+          {files.map((f) => (
+            <div
+              key={f.id}
+              className={clsx("workspace-file-item", selectedFile?.path === f.path && "active")}
+              onClick={() => openFile(f.path)}
+            >
+              <FileCode2 size={14} />
+              <span className="workspace-file-path">{f.path}</span>
+              <small>{formatBytes(f.sizeBytes)}</small>
+              <button
+                type="button"
+                className="workspace-delete-btn"
+                onClick={(e) => { e.stopPropagation(); deleteFile(f.path); }}
+                title="Delete file"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+
+        {selectedFile && (
+          <div className="workspace-file-view">
+            <div className="workspace-file-view-header">
+              <strong>{selectedFile.path}</strong>
+            </div>
+            <pre className="workspace-file-content">{selectedFile.content}</pre>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2999,13 +3950,19 @@ function BillingPanel({
             </div>
             <p className="fine-print">
               Current period ends {new Date(data.entitlement.currentPeriodEnd).toDateString()}.
+              {data.testingUnlimited === true && (
+                <>
+                  {" "}
+                  <strong>Testing mode</strong> — chat usage does not debit your wallet.
+                </>
+              )}
             </p>
             <div className="wallet-bars">
               <div className="wallet-line">
                 <div>
                   <span>Subscription tokens</span>
                 </div>
-                <strong>{formatNumber(subRem)}</strong>
+                <strong>{data.testingUnlimited === true ? "∞ (testing)" : formatNumber(subRem)}</strong>
               </div>
               <div className="wallet-line">
                 <div>
@@ -3301,10 +4258,13 @@ function ProfileTab({ user, onSaved }: { user: User; onSaved: () => Promise<void
 /* ============================ Live Status panel ============================ */
 
 function LiveStatusPanel({ data }: { data: AppData }) {
+  const testingUnlimited = data.testingUnlimited === true;
   const subRem = data.wallet?.subscriptionTokensRemaining ?? 0;
   const monthlyCap = data.entitlement.plan.monthlyTokens;
-  const usedSub = monthlyCap > 0 ? Math.max(0, monthlyCap - subRem) : 0;
-  const tokenBarPct = monthlyCap > 0 ? Math.min(100, (usedSub / monthlyCap) * 100) : 0;
+  const usedSub =
+    testingUnlimited ? 0 : monthlyCap > 0 ? Math.max(0, monthlyCap - subRem) : 0;
+  const tokenBarPct =
+    testingUnlimited ? 0 : monthlyCap > 0 ? Math.min(100, (usedSub / monthlyCap) * 100) : 0;
   const deployed = data.userAgents.filter((a) => a.status === "DEPLOYED").length;
   const inFlight = data.tasks.filter((t) => t.status === "QUEUED" || t.status === "RUNNING").length;
   const today = new Date();
@@ -3323,9 +4283,11 @@ function LiveStatusPanel({ data }: { data: AppData }) {
         </div>
         <div className="stat-card">
           <span>Tokens used</span>
-          <strong>{Math.round(tokenBarPct)}%</strong>
+          <strong>{testingUnlimited ? "∞" : `${Math.round(tokenBarPct)}%`}</strong>
           <div className="stat-card-trend">
-            {formatTokenShort(usedSub)} / {monthlyCap > 0 ? formatTokenShort(monthlyCap) : "∞"}
+            {testingUnlimited
+              ? "Testing — debits off"
+              : `${formatTokenShort(usedSub)} / ${monthlyCap > 0 ? formatTokenShort(monthlyCap) : "∞"}`}
           </div>
         </div>
         <div className="stat-card">

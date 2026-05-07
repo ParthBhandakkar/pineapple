@@ -2,14 +2,19 @@ import { prisma } from "@/lib/prisma";
 import { HttpError } from "@/lib/http";
 import { addMonths } from "@/lib/time";
 import { writeLog } from "@/lib/logs";
+import { isTestingUnlimited } from "@/lib/testing-unlimited";
+
+const CHARS_PER_TOKEN = 4;
+const OUTPUT_MULTIPLIER = 1.6;
+const MIN_OUTPUT_RESERVE = 250;
 
 export function estimateTokens(text: string) {
-  return Math.max(1, Math.ceil(text.trim().length / 4));
+  return Math.max(1, Math.ceil(text.trim().length / CHARS_PER_TOKEN));
 }
 
 export function estimateTaskCost(prompt: string) {
   const input = estimateTokens(prompt);
-  const reservedOutput = Math.max(250, Math.ceil(input * 1.6));
+  const reservedOutput = Math.max(MIN_OUTPUT_RESERVE, Math.ceil(input * OUTPUT_MULTIPLIER));
   return input + reservedOutput;
 }
 
@@ -98,6 +103,10 @@ export async function resetSubscriptionTokensIfNeeded(userId: string) {
 
 export async function debitTokens(userId: string, amount: number, reason: string, metadata?: unknown) {
   if (amount <= 0) {
+    return;
+  }
+
+  if (isTestingUnlimited()) {
     return;
   }
 

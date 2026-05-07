@@ -79,7 +79,7 @@ export function AuthPanel({ compact = false }: { compact?: boolean }) {
         {mode === "register" && (
           <label>
             Name
-            <input name="name" required minLength={2} placeholder="Aman Jain" />
+            <input name="name" required minLength={2} placeholder="Your full name" />
           </label>
         )}
         <label>
@@ -88,8 +88,7 @@ export function AuthPanel({ compact = false }: { compact?: boolean }) {
             name="email"
             type="email"
             required
-            placeholder={mode === "login" ? "demo@agentsim.local" : "you@company.com"}
-            defaultValue={mode === "login" ? "demo@agentsim.local" : ""}
+            placeholder={mode === "login" ? "you@example.com" : "you@company.com"}
           />
         </label>
         <label>
@@ -99,8 +98,7 @@ export function AuthPanel({ compact = false }: { compact?: boolean }) {
             type="password"
             required
             minLength={6}
-            placeholder={mode === "login" ? "demo123" : "Minimum 6 characters"}
-            defaultValue={mode === "login" ? "demo123" : ""}
+            placeholder={mode === "login" ? "Your password" : "Minimum 6 characters"}
           />
         </label>
         <button className="primary-button" disabled={loading}>
@@ -110,8 +108,8 @@ export function AuthPanel({ compact = false }: { compact?: boolean }) {
 
       {message.trim() && <p className="form-message">{message}</p>}
 
-      {!compact && <div className="demo-note">
-        Admin seed: <strong>admin@agentsim.local</strong> / <strong>admin123</strong>
+      {!compact && process.env.NEXT_PUBLIC_DEMO_MODE === "true" && <div className="demo-note">
+        Demo: <strong>demo@agentsim.local</strong> / <strong>demo123</strong>
       </div>}
     </aside>
   );
