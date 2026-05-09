@@ -138,6 +138,19 @@ type Message = {
   createdAt: string;
   tokenEstimate?: number;
   modelUsed?: string;
+  _streaming?: boolean;
+  _toolCalls?: ToolCallData[];
+};
+
+type ToolCallData = {
+  callId: string;
+  name: string;
+  args: Record<string, unknown>;
+  result?: {
+    success: boolean;
+    result?: unknown;
+    error?: string;
+  };
 };
 
 type ProjectFile = {
@@ -379,6 +392,29 @@ function formatRelativeTime(iso: string) {
   return date.toLocaleDateString();
 }
 
+function formatElapsedTime(iso: string) {
+  const elapsedMs = Math.max(0, Date.now() - new Date(iso).getTime());
+  const totalSeconds = Math.floor(elapsedMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 1) return `${seconds}s`;
+  if (minutes < 60) return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${minutes % 60}m`;
+}
+
+function taskProgress(task: Task) {
+  const status = task.status.toUpperCase();
+  if (status === "QUEUED") return { label: "Queued for worker", percent: 12, tone: "" };
+  if (status !== "RUNNING") return null;
+
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - new Date(task.createdAt).getTime()) / 1000));
+  if (ageSeconds < 45) return { label: "Worker starting", percent: 28, tone: "" };
+  if (ageSeconds < 180) return { label: "Generating response", percent: 52, tone: "" };
+  if (ageSeconds < 420) return { label: "Still working", percent: 74, tone: "" };
+  return { label: "Taking longer than usual", percent: 88, tone: "slow" };
+}
+
 function shortDate(value: string) {
   return new Intl.DateTimeFormat("en-IN", {
     day: "2-digit",
@@ -434,6 +470,20 @@ function isModelProviderErrorMessage(message: string | null | undefined) {
   );
 }
 
+function normalizeModelLabel(model: string) {
+  const trimmed = model.trim();
+  const openRouterMatch = /^openrouter\/(.+)$/i.exec(trimmed);
+  if (!openRouterMatch) return trimmed;
+
+  const withoutPrefix = openRouterMatch[1];
+  const segments = withoutPrefix.split("/");
+  if (segments.length === 0) return trimmed;
+
+  const provider = segments[0];
+  const normalizedProvider = `${provider[0]?.toUpperCase()}${provider.slice(1)}`;
+  return [normalizedProvider, ...segments.slice(1)].join("/");
+}
+
 async function readApiError(response: Response) {
   const text = await response.text().catch(() => "");
 
@@ -453,6 +503,152 @@ async function readApiError(response: Response) {
   return trimmed.length > 0 ? trimmed.slice(0, 500) : `Request failed (${response.status})`;
 }
 
+const MAX_ATTACHMENT_TEXT_BYTES = 120_000;
+const READABLE_TEXT_EXTENSIONS = new Set([
+  "txt",
+  "md",
+  "json",
+  "js",
+  "jsx",
+  "ts",
+  "tsx",
+  "py",
+  "java",
+  "kt",
+  "cs",
+  "cpp",
+  "c",
+  "go",
+  "rs",
+  "rb",
+  "php",
+  "sql",
+  "html",
+  "htm",
+  "css",
+  "scss",
+  "sass",
+  "less",
+  "xml",
+  "yml",
+  "yaml",
+  "toml",
+  "ini",
+  "sh",
+  "bash",
+  "bat",
+  "ps1",
+  "dockerfile",
+  "env",
+]);
+
+function attachmentLanguageLabel(name: string, mime: string) {
+  const ext = name.includes(".") ? name.split(".").pop()?.toLowerCase() || "" : "";
+  const lowerName = name.toLowerCase();
+  if (lowerName === "dockerfile") {
+    return "dockerfile";
+  }
+  const map: Record<string, string> = {
+    ts: "typescript",
+    tsx: "tsx",
+    js: "javascript",
+    jsx: "javascript",
+    py: "python",
+    java: "java",
+    kt: "kotlin",
+    cs: "csharp",
+    cpp: "cpp",
+    c: "c",
+    go: "go",
+    rs: "rust",
+    rb: "ruby",
+    php: "php",
+    sql: "sql",
+    html: "html",
+    htm: "html",
+    css: "css",
+    scss: "scss",
+    sass: "sass",
+    less: "less",
+    json: "json",
+    yml: "yaml",
+    yaml: "yaml",
+    toml: "toml",
+    md: "markdown",
+    sh: "bash",
+    bash: "bash",
+    ps1: "powershell",
+    dockerfile: "docker",
+    env: "ini",
+    ini: "ini",
+    xml: "xml",
+    txt: "text",
+  };
+  return map[ext] || (mime.includes("json") ? "json" : mime.startsWith("text/") ? mime.split("/")[1] || "text" : "text");
+}
+
+function isLikelyReadableTextFile(file: ChatAttachment) {
+  const mime = file.mime.toLowerCase();
+  const ext = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() || "" : "";
+  const lowerName = file.name.toLowerCase();
+  if (lowerName === "dockerfile") {
+    return true;
+  }
+  if (mime.startsWith("text/")) return true;
+  if (mime === "application/json" || mime === "application/xml" || mime.includes("javascript") || mime.includes("yaml") || mime.includes("yml")) {
+    return true;
+  }
+  return READABLE_TEXT_EXTENSIONS.has(ext);
+}
+
+async function readFileAsText(file: File, maxBytes: number) {
+  const readTarget = file.size > maxBytes ? file.slice(0, maxBytes) : file;
+  const text = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve((reader.result as string) || "");
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsText(readTarget);
+  });
+  return text.length > maxBytes ? text.slice(0, maxBytes) : text;
+}
+
+function buildAttachmentPromptBlock(file: ChatAttachment, content: string, truncated: boolean) {
+  const descriptor = `${file.name} (${formatBytes(file.size)}, ${file.mime || "file"})`;
+  const language = attachmentLanguageLabel(file.name, file.mime);
+  const truncatedNotice = truncated ? "\n\n[Content truncated due size constraints]" : "";
+  if (file.mime.startsWith("image/")) {
+    return `- ${descriptor} [image attachment]`;
+  }
+  return `- ${descriptor}\n\`\`\`${language}\n${content}\n\`\`\`${truncatedNotice}`;
+}
+
+async function buildAttachmentPromptSections(attachments: ChatAttachment[]) {
+  if (!attachments.length) return [];
+
+  const sections: string[] = [];
+  for (const file of attachments) {
+    if (file.mime.startsWith("image/")) {
+      sections.push(`- ${file.name} (${formatBytes(file.size)}, ${file.mime || "image"}) [image attachment]`);
+      continue;
+    }
+
+    if (!isLikelyReadableTextFile(file)) {
+      sections.push(`- ${file.name} (${formatBytes(file.size)}, ${file.mime || "binary file"}): [content omitted]`);
+      continue;
+    }
+
+    try {
+      const content = await readFileAsText(file.file, MAX_ATTACHMENT_TEXT_BYTES);
+      const truncated = content.length === MAX_ATTACHMENT_TEXT_BYTES;
+      const safeContent = content.replace(/```/g, "\\`\\`\\`");
+      sections.push(buildAttachmentPromptBlock(file, safeContent, truncated));
+    } catch {
+      sections.push(`- ${file.name} (${formatBytes(file.size)}, ${file.mime || "file"}): [failed to read file content]`);
+    }
+  }
+  return sections;
+}
+
 async function loadRazorpayScript() {
   if (document.querySelector('script[src="https://checkout.razorpay.com/v1/checkout.js"]')) {
     return true;
@@ -464,6 +660,19 @@ async function loadRazorpayScript() {
     script.onerror = () => resolve(false);
     document.body.appendChild(script);
   });
+}
+
+function updateAssistantMessage(
+  messages: Message[],
+  assistantId: string,
+  textContent: string,
+  toolCalls: ToolCallData[]
+): Message[] {
+  return messages.map((msg) =>
+    msg.id === assistantId
+      ? { ...msg, content: textContent, _toolCalls: toolCalls, _streaming: textContent === "" && toolCalls.length === 0 }
+      : msg
+  );
 }
 
 function isProjectArtifact(value: unknown): value is ProjectArtifact {
@@ -954,6 +1163,7 @@ function DashboardInner() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const speechRecognitionRef = useRef<unknown>(null);
   const chatLogRef = useRef<HTMLDivElement | null>(null);
+  const chatFormRef = useRef<HTMLFormElement | null>(null);
   const modelMenuRef = useRef<HTMLDivElement | null>(null);
 
   const selectedBillingModel = selectedModelInfo(selectedModelCode);
@@ -1170,8 +1380,22 @@ function DashboardInner() {
     }
 
     const allAttachmentLines = attachments.map((a) => `- ${a.name} (${formatBytes(a.size)})`);
+    const attachmentPromptSections = await buildAttachmentPromptSections(attachments);
+    const promptPayload =
+      attachmentPromptSections.length > 0
+        ? `${prompt.trim()}\n\nAttached files:\n${attachmentPromptSections.join("\n\n")}`
+        : prompt.trim();
+    if (promptPayload.length > 700_000) {
+      toast.show({
+        tone: "warning",
+        title: "Message too long",
+        body: "Attached file contents exceed the maximum request size. Reduce attachments or shorten content.",
+      });
+      setChatBusy(false);
+      return;
+    }
 
-    // Read image attachments as base64 data URLs for multimodal model input
+    // Read image attachments as base64 data URLs for multimodal model input.
     const imageDataUrls: string[] = [];
     for (const a of attachments) {
       if (a.mime.startsWith("image/")) {
@@ -1190,15 +1414,6 @@ function DashboardInner() {
         }
       }
     }
-
-    const nonImageAttachments = attachments.filter((a) => !a.mime.startsWith("image/"));
-    const nonImageLines = nonImageAttachments.map((a) => `- ${a.name} (${formatBytes(a.size)})`);
-
-    // Prompt sent to model: only includes non-image file names (images are sent as data URLs)
-    const promptPayload =
-      nonImageLines.length > 0
-        ? `${prompt.trim()}\n\nAttached files:\n${nonImageLines.join("\n")}`
-        : prompt.trim();
 
     // Display text for the user bubble: shows all attachment names
     const displayPayload =
@@ -1233,7 +1448,7 @@ function DashboardInner() {
         setConversationId(activeConversationId);
       }
 
-      const response = await fetch("/api/chat", {
+      const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1260,55 +1475,192 @@ function DashboardInner() {
         return;
       }
 
-      const body = (await response.json()) as {
-        status: string;
-        task?: { id?: string; tokenCost?: number };
-      };
-      setPrompt("");
-      setAttachments([]);
+      const contentType = response.headers.get("content-type") ?? "";
+      const body = contentType.includes("application/json")
+        ? ((await response.json()) as {
+            status: string;
+            task?: { id?: string; tokenCost?: number };
+          })
+        : null;
 
-      if (body.status === "PENDING_APPROVAL") {
-        toast.show({
-          tone: "warning",
-          title: "Approval required",
-          body: "This high-risk action is awaiting your approval in Requests.",
-        });
-      } else if (body.status === "RUNNING" || body.status === "QUEUED") {
-        const nowIso = new Date().toISOString();
-        setPendingMessagesByConversation((current) => ({
-          ...current,
-          [activeConversationId]: [
-            ...(current[activeConversationId] ?? []),
-            {
-              id: `pending-user-${Date.now()}`,
-              role: "USER",
-              content: displayPayload,
-              createdAt: nowIso,
-            },
-            {
-              id: `pending-assistant-${Date.now()}`,
-              role: "ASSISTANT",
-              content: "waiting...",
-              createdAt: nowIso,
-            },
-          ],
-        }));
-        if (body.task?.id) {
-          pendingTaskToConversationRef.current[body.task.id] = activeConversationId;
+      if (body) {
+        if (body.status === "PENDING_APPROVAL") {
+          toast.show({
+            tone: "warning",
+            title: "Approval required",
+            body: "This high-risk action is awaiting your approval in Requests.",
+          });
+        } else if (body.status === "RUNNING" || body.status === "QUEUED") {
+          toast.show({
+            tone: "info",
+            title: "Working on it",
+            body: "Your message is queued. The reply will appear here shortly.",
+          });
+          if (body.task?.id) {
+            pendingTaskToConversationRef.current[body.task.id] = activeConversationId;
+          }
+        } else {
+          toast.show({
+            tone: "success",
+            title: "Task completed",
+            body: `${formatNumber(body.task?.tokenCost ?? 0)} token(s) consumed.`,
+          });
         }
-        toast.show({
-          tone: "info",
-          title: "Working on it",
-          body: "Your message is queued. The reply will appear here shortly.",
-        });
-      } else {
-        toast.show({
-          tone: "success",
-          title: "Task completed",
-          body: `${formatNumber(body.task?.tokenCost ?? 0)} token(s) consumed.`,
-        });
+
+        await loadData();
+        setChatBusy(false);
+        return;
       }
 
+      // Stream the response
+      const nowIso = new Date().toISOString();
+      const userMessageId = `pending-user-${Date.now()}`;
+      const assistantMessageId = `pending-assistant-${Date.now()}`;
+
+      setPendingMessagesByConversation((current) => ({
+        ...current,
+        [activeConversationId]: [
+          ...(current[activeConversationId] ?? []),
+          {
+            id: userMessageId,
+            role: "USER",
+            content: displayPayload,
+            createdAt: nowIso,
+          },
+          {
+            id: assistantMessageId,
+            role: "ASSISTANT",
+            content: "",
+            createdAt: nowIso,
+            _streaming: true,
+          },
+        ],
+      }));
+
+      setPrompt("");
+      setAttachments([]);
+      setChatBusy(false);
+
+      // Stream handler state
+      let streamedText = "";
+      const streamedToolCalls: ToolCallData[] = [];
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        toast.show({ tone: "danger", title: "Stream error", body: "Response body is not readable" });
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      const processStream = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            let eventType = "";
+            for (const line of lines) {
+              if (line.startsWith("event: ")) {
+                eventType = line.slice(7).trim();
+                continue;
+              }
+              if (line.startsWith("data: ") && eventType) {
+                const dataStr = line.slice(6).trim();
+                if (!dataStr || dataStr === "{}") continue;
+
+                try {
+                  const data = JSON.parse(dataStr);
+
+                  if (eventType === "tool_call") {
+                    streamedToolCalls.push({
+                      callId: data.callId,
+                      name: data.name,
+                      args: data.args,
+                    });
+                    setPendingMessagesByConversation((current) => ({
+                      ...current,
+                      [activeConversationId]: updateAssistantMessage(
+                        current[activeConversationId] || [],
+                        assistantMessageId,
+                        streamedText,
+                        streamedToolCalls
+                      ),
+                    }));
+                  }
+
+                  if (eventType === "tool_result") {
+                    const tcIndex = streamedToolCalls.findIndex((tc) => tc.callId === data.callId);
+                    if (tcIndex >= 0) {
+                      streamedToolCalls[tcIndex].result = {
+                        success: data.success,
+                        result: data.result,
+                        error: data.error,
+                      };
+                      setPendingMessagesByConversation((current) => ({
+                        ...current,
+                        [activeConversationId]: updateAssistantMessage(
+                          current[activeConversationId] || [],
+                          assistantMessageId,
+                          streamedText,
+                          streamedToolCalls
+                        ),
+                      }));
+                    }
+                  }
+
+                  if (eventType === "text_delta") {
+                    streamedText += data.delta || "";
+                    setPendingMessagesByConversation((current) => ({
+                      ...current,
+                      [activeConversationId]: updateAssistantMessage(
+                        current[activeConversationId] || [],
+                        assistantMessageId,
+                        streamedText,
+                        streamedToolCalls
+                      ),
+                    }));
+                  }
+
+                  if (eventType === "text") {
+                    streamedText = data.content || "";
+                    setPendingMessagesByConversation((current) => ({
+                      ...current,
+                      [activeConversationId]: updateAssistantMessage(
+                        current[activeConversationId] || [],
+                        assistantMessageId,
+                        streamedText,
+                        streamedToolCalls
+                      ),
+                    }));
+                  }
+                } catch {
+                  // Skip malformed JSON
+                }
+              }
+            }
+          }
+
+          // Final update and refresh data
+          await loadData();
+        } catch (error) {
+          if (error instanceof Error && error.name !== "AbortError") {
+            toast.show({ tone: "danger", title: "Stream error", body: error.message });
+          }
+        }
+      };
+
+      processStream();
+      toast.show({
+        tone: "info",
+        title: "Working on it",
+        body: "Your message is being processed. Reply will appear here when ready.",
+      });
       await loadData();
     } catch (error) {
       const message =
@@ -1318,6 +1670,46 @@ function DashboardInner() {
       toast.show({ tone: "danger", title: "Network error", body: message });
     } finally {
       setChatBusy(false);
+    }
+  }
+
+  async function ensureConversationLoaded(conversationId: string): Promise<Conversation | null> {
+    if (!data) return null;
+
+    const existing = data.conversations.find((conversation) => conversation.id === conversationId);
+    if (existing) return existing;
+
+    try {
+      const response = await fetch(`/api/conversations/${conversationId}`, { cache: "no-store" });
+      if (!response.ok) {
+        toast.show({
+          tone: "danger",
+          title: "Could not open chat",
+          body: await readApiError(response),
+        });
+        return null;
+      }
+
+      const body = (await response.json()) as { conversation: Conversation };
+      const conversation = body.conversation;
+
+      setData((prev) => {
+        if (!prev) return prev;
+        if (prev.conversations.some((item) => item.id === conversation.id)) return prev;
+        return {
+          ...prev,
+          conversations: [conversation, ...prev.conversations],
+        };
+      });
+
+      return conversation;
+    } catch {
+      toast.show({
+        tone: "danger",
+        title: "Could not open chat",
+        body: "Failed to load the linked session from the server.",
+      });
+      return null;
     }
   }
 
@@ -1344,6 +1736,63 @@ function DashboardInner() {
     } finally {
       setChatBusy(false);
     }
+  }
+
+  async function cancelTask(task: Task) {
+    if (chatBusy) return;
+    setChatBusy(true);
+    try {
+      const response = await fetch("/api/chat/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: task.id }),
+      });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Cancel failed", body: await readApiError(response) });
+        return;
+      }
+      toast.show({ tone: "info", title: "Task cancelled", body: "The in-flight run was stopped from updating this chat." });
+      await loadData();
+    } catch {
+      toast.show({ tone: "danger", title: "Network error", body: "Could not reach the server." });
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function retryMessageFromError(message: Message, conversationId: string) {
+    if (!data) return;
+
+    const matchedTask = data.tasks
+      .filter((task) => task.conversationId === conversationId && task.status === "FAILED")
+      .filter((task) => task.result === message.content)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+
+    if (matchedTask) {
+      await retryTask(matchedTask);
+      return;
+    }
+
+    const targetConversation = data.conversations.find((item) => item.id === conversationId);
+    if (!targetConversation) {
+      toast.show({ tone: "danger", title: "Could not retry", body: "The conversation is no longer available." });
+      return;
+    }
+
+    const messageIndex = targetConversation.messages.findIndex((item) => item.id === message.id);
+    const userMsg = targetConversation.messages
+      .slice(0, messageIndex === -1 ? targetConversation.messages.length : messageIndex)
+      .filter((m) => m.role === "USER")
+      .pop();
+    if (!userMsg) {
+      toast.show({ tone: "warning", title: "Could not retry", body: "No user prompt was found for this assistant output." });
+      return;
+    }
+
+    const retryPrompt = userMsg.content.split("\n\nAttached files:")[0];
+    setPrompt(retryPrompt);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    chatFormRef.current?.requestSubmit();
   }
 
   function addAttachments(fileList: FileList | null) {
@@ -2222,6 +2671,7 @@ function DashboardInner() {
             createConversation={createConversation}
             selectedConversation={selectedConversationWithPending}
             chatLogRef={chatLogRef}
+            chatFormRef={chatFormRef}
             chatBusy={chatBusy}
             sendPrompt={sendPrompt}
             prompt={prompt}
@@ -2245,6 +2695,7 @@ function DashboardInner() {
             setSelectedModelCode={setSelectedModelCode}
             syncModelSelectionToAssistant={syncModelSelectionToAssistant}
             allowedMaxMultiplier={allowedMaxMultiplier}
+            onRetryFromMessage={retryMessageFromError}
           />
         )}
 
@@ -2321,25 +2772,38 @@ function DashboardInner() {
             tasks={data.tasks}
             stats={taskStats}
             onRetry={(task) => retryTask(task)}
+            onCancel={(task) => cancelTask(task)}
             onOpenTaskInChat={(task) => {
-              if (!task.conversationId) {
-                toast.show({
-                  tone: "warning",
-                  title: "No linked chat",
-                  body: "This task is not tied to a chat session.",
-                });
-                return;
-              }
-              const fromTask = task.agentId ?? task.agent?.id ?? null;
-              const fromConversation = data.conversations.find((c) => c.id === task.conversationId)?.agent?.id ?? null;
-              const nextAgentId = fromTask ?? fromConversation;
-              if (nextAgentId) setSelectedAgentId(nextAgentId);
-              setConversationId(task.conversationId);
-              setActiveTab("chat");
+              void (async () => {
+                if (!task.conversationId) {
+                  toast.show({
+                    tone: "warning",
+                    title: "No linked chat",
+                    body: "This task is not tied to a chat session.",
+                  });
+                  return;
+                }
+
+                const targetConversation = await ensureConversationLoaded(task.conversationId);
+                if (!targetConversation) {
+                  toast.show({
+                    tone: "warning",
+                    title: "Session not available",
+                    body: "Could not open this linked chat session.",
+                  });
+                  return;
+                }
+
+                const fromTask = task.agentId ?? task.agent?.id ?? null;
+                const fromConversation = targetConversation.agent?.id ?? null;
+                const nextAgentId = fromTask ?? fromConversation;
+                if (nextAgentId) setSelectedAgentId(nextAgentId);
+                setConversationId(task.conversationId);
+                setActiveTab("chat");
+              })();
             }}
           />
         )}
-
         {!showAdmin && profileTab === null && activeTab === "workspace" && (
           <WorkspaceTab />
         )}
@@ -2567,6 +3031,7 @@ function ChatTab(props: {
   createConversation: () => void;
   selectedConversation: Conversation | undefined;
   chatLogRef: React.RefObject<HTMLDivElement | null>;
+  chatFormRef: React.RefObject<HTMLFormElement | null>;
   chatBusy: boolean;
   sendPrompt: (event: FormEvent<HTMLFormElement>) => void;
   prompt: string;
@@ -2590,6 +3055,7 @@ function ChatTab(props: {
   setSelectedModelCode: (v: string) => void;
   syncModelSelectionToAssistant: (code: string) => Promise<void>;
   allowedMaxMultiplier: number;
+  onRetryFromMessage?: (message: Message, conversationId: string) => void;
 }) {
   const {
     data,
@@ -2598,6 +3064,7 @@ function ChatTab(props: {
     createConversation,
     selectedConversation,
     chatLogRef,
+    chatFormRef,
     chatBusy,
     sendPrompt,
     prompt,
@@ -2621,6 +3088,7 @@ function ChatTab(props: {
     setSelectedModelCode,
     syncModelSelectionToAssistant,
     allowedMaxMultiplier,
+    onRetryFromMessage,
   } = props;
 
   const selectedModel = selectedModelInfo(selectedModelCode);
@@ -2667,16 +3135,23 @@ function ChatTab(props: {
                     className="task-retry-btn"
                     style={{ marginTop: 10 }}
                     onClick={() => {
-                      const userMsg = selectedConversation?.messages
-                        .slice(0, selectedConversation.messages.indexOf(item))
+                      if (selectedConversation?.id && onRetryFromMessage) {
+                        onRetryFromMessage(item, selectedConversation.id);
+                        return;
+                      }
+
+                      if (!selectedConversation) return;
+                      const fallbackIndex =
+                        selectedConversation.messages.findIndex((conversationMessage) => conversationMessage.id === item.id);
+                      const userMsg = selectedConversation.messages
+                        .slice(0, fallbackIndex === -1 ? selectedConversation.messages.length : fallbackIndex)
                         .filter((m) => m.role === "USER")
                         .pop();
                       if (userMsg) {
                         const retryPrompt = userMsg.content.split("\n\nAttached files:")[0];
                         setPrompt(retryPrompt);
                         setTimeout(() => {
-                          const form = document.querySelector("form");
-                          if (form) form.requestSubmit();
+                          chatFormRef.current?.requestSubmit();
                         }, 100);
                       }
                     }}
@@ -2685,7 +3160,10 @@ function ChatTab(props: {
                   </button>
                 )}
                 {item.role === "ASSISTANT" && typeof item.tokenEstimate === "number" && item.tokenEstimate > 0 && (
-                  <small>Tokens: {formatNumber(item.tokenEstimate)}{item.modelUsed ? ` · ${item.modelUsed}` : ""}</small>
+                  <small>
+                    Tokens: {formatNumber(item.tokenEstimate)}
+                    {item.modelUsed ? ` · ${normalizeModelLabel(item.modelUsed)}` : ""}
+                  </small>
                 )}
               </article>
             );
@@ -2701,7 +3179,7 @@ function ChatTab(props: {
         </div>
 
         {/* ===== Single chat input row (Gemini/ChatGPT style) ===== */}
-        <form onSubmit={sendPrompt}>
+        <form ref={chatFormRef} onSubmit={sendPrompt}>
           <div className="chat-input-shell">
             <input
               ref={fileInputRef}
@@ -2852,9 +3330,80 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
           {copied ? <><Check size={13} /> Copied</> : <><Clipboard size={13} /> Copy</>}
         </button>
       </div>
-      <pre className="code-block-pre"><code>{code}</code></pre>
+      <pre className="code-block-pre"><code dangerouslySetInnerHTML={{ __html: highlightCode(code, language || "") }} /></pre>
     </div>
   );
+}
+
+function getLanguageFromPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const map: Record<string, string> = {
+    ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
+    mjs: "javascript", cjs: "javascript", py: "python", rb: "ruby",
+    go: "go", rs: "rust", java: "java", css: "css", scss: "scss",
+    html: "html", htm: "html", json: "json", yaml: "yaml", yml: "yaml",
+    xml: "xml", svg: "svg", md: "markdown", sh: "bash", bash: "bash",
+    sql: "sql", toml: "toml", env: "bash", dockerfile: "bash",
+  };
+  return map[ext] || ext || "text";
+}
+
+function highlightCode(code: string, language: string): string {
+  const lang = language.toLowerCase();
+  const escaped = code
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
+  if (!lang || lang === "text" || lang === "plaintext") return escaped;
+
+  let highlighted = escaped;
+
+  // Comments (single-line)
+  highlighted = highlighted.replace(
+    /(\/\/[^\n]*)/g,
+    '<span class="hl-comment">$1</span>'
+  );
+
+  // Strings (double and single quotes, template literals)
+  highlighted = highlighted.replace(
+    /(?<!\\)(&quot;(?:\\.|[^&])*?&quot;|&#39;(?:\\.|[^&])*?&#39;|`(?:\\.|[^`])*?`|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g,
+    '<span class="hl-string">$1</span>'
+  );
+
+  // Numbers
+  highlighted = highlighted.replace(
+    /\b(\d+\.?\d*(?:e[+-]?\d+)?|0x[\da-fA-F]+|0b[01]+|0o[0-7]+)\b/g,
+    '<span class="hl-number">$1</span>'
+  );
+
+  // Keywords based on language
+  const jsKeywords = /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|class|extends|import|export|from|default|new|this|typeof|instanceof|void|null|undefined|true|false|async|await|try|catch|finally|throw|yield|of|in|delete|super|static|get|set|constructor)\b/g;
+  const pyKeywords = /\b(def|class|return|if|elif|else|for|while|import|from|as|try|except|finally|raise|with|yield|lambda|pass|break|continue|and|or|not|in|is|None|True|False|self|global|nonlocal|assert|del|print)\b/g;
+  const htmlKeywords = /(&lt;\/?)([\w-]+)/g;
+  const cssKeywords = /\b(display|position|margin|padding|width|height|color|background|border|font|flex|grid|align|justify|text|overflow|opacity|transition|transform|animation|box-shadow|z-index|top|left|right|bottom|content|cursor|visibility|gap|max-width|min-width|max-height|min-height)\b/g;
+
+  if (["js", "javascript", "ts", "typescript", "jsx", "tsx", "mjs", "cjs"].includes(lang)) {
+    highlighted = highlighted.replace(jsKeywords, '<span class="hl-keyword">$1</span>');
+  } else if (["python", "py"].includes(lang)) {
+    highlighted = highlighted.replace(pyKeywords, '<span class="hl-keyword">$1</span>');
+  } else if (["html", "htm", "xml", "svg"].includes(lang)) {
+    highlighted = highlighted.replace(htmlKeywords, '$1<span class="hl-tag">$2</span>');
+    highlighted = highlighted.replace(/([\w-]+)=/g, '<span class="hl-attr">$1</span>=');
+  } else if (["css", "scss", "sass", "less"].includes(lang)) {
+    highlighted = highlighted.replace(cssKeywords, '<span class="hl-property">$1</span>');
+    highlighted = highlighted.replace(/(#[\da-fA-F]{3,8})\b/g, '<span class="hl-number">$1</span>');
+  } else if (["json"].includes(lang)) {
+    highlighted = highlighted.replace(/("[\w-]+")\s*:/g, '<span class="hl-property">$1</span>:');
+  } else if (["bash", "sh", "shell", "zsh"].includes(lang)) {
+    highlighted = highlighted.replace(/(#[^\n]*)/g, '<span class="hl-comment">$1</span>');
+    highlighted = highlighted.replace(/\b(sudo|cd|ls|mkdir|rm|cp|mv|echo|cat|grep|sed|awk|curl|wget|git|npm|npx|yarn|pnpm|pip|python|node|docker)\b/g, '<span class="hl-keyword">$1</span>');
+  } else {
+    // Generic keyword highlighting
+    highlighted = highlighted.replace(jsKeywords, '<span class="hl-keyword">$1</span>');
+  }
+
+  return highlighted;
 }
 
 function renderMessageContent(content: string) {
@@ -2873,18 +3422,119 @@ function renderMessageContent(content: string) {
     parts.push({ type: "text", text: content.slice(lastIndex) });
   }
   if (parts.length === 0) return <p>{content}</p>;
-  if (parts.length === 1 && parts[0].type === "text") return <p>{parts[0].text}</p>;
+  if (parts.length === 1 && parts[0].type === "text") return <MarkdownText text={parts[0].text} />;
   return (
     <div className="message-rich-content">
       {parts.map((part, i) =>
         part.type === "code" ? (
           <CodeBlock key={i} code={part.code} language={part.lang} />
         ) : (
-          <p key={i}>{part.text}</p>
+          <MarkdownText key={i} text={part.text} />
         )
       )}
     </div>
   );
+}
+
+function MarkdownText({ text }: { text: string }) {
+  const lines = text.split("\n");
+  const elements: React.ReactNode[] = [];
+  let listItems: string[] = [];
+  let orderedListItems: string[] = [];
+  let listType: "ul" | "ol" | null = null;
+
+  function flushList() {
+    if (listType === "ul" && listItems.length > 0) {
+      elements.push(
+        <ul key={`ul-${elements.length}`} className="md-list">
+          {listItems.map((item, j) => <li key={j}>{renderInline(item)}</li>)}
+        </ul>
+      );
+      listItems = [];
+    }
+    if (listType === "ol" && orderedListItems.length > 0) {
+      elements.push(
+        <ol key={`ol-${elements.length}`} className="md-list md-ol">
+          {orderedListItems.map((item, j) => <li key={j}>{renderInline(item)}</li>)}
+        </ol>
+      );
+      orderedListItems = [];
+    }
+    listType = null;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Headers
+    const h3Match = line.match(/^###\s+(.+)/);
+    if (h3Match) { flushList(); elements.push(<h4 key={i} className="md-h3">{renderInline(h3Match[1])}</h4>); continue; }
+    const h2Match = line.match(/^##\s+(.+)/);
+    if (h2Match) { flushList(); elements.push(<h3 key={i} className="md-h2">{renderInline(h2Match[1])}</h3>); continue; }
+    const h1Match = line.match(/^#\s+(.+)/);
+    if (h1Match) { flushList(); elements.push(<h2 key={i} className="md-h1">{renderInline(h1Match[1])}</h2>); continue; }
+
+    // Unordered list
+    const ulMatch = line.match(/^[\s]*[-*+]\s+(.+)/);
+    if (ulMatch) {
+      if (listType !== "ul") { flushList(); listType = "ul"; }
+      listItems.push(ulMatch[1]);
+      continue;
+    }
+
+    // Ordered list
+    const olMatch = line.match(/^[\s]*\d+[.)]\s+(.+)/);
+    if (olMatch) {
+      if (listType !== "ol") { flushList(); listType = "ol"; }
+      orderedListItems.push(olMatch[1]);
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^[-*_]{3,}\s*$/.test(line)) { flushList(); elements.push(<hr key={i} className="md-hr" />); continue; }
+
+    // Blockquote
+    const bqMatch = line.match(/^>\s*(.*)/);
+    if (bqMatch) { flushList(); elements.push(<blockquote key={i} className="md-blockquote">{renderInline(bqMatch[1])}</blockquote>); continue; }
+
+    // Empty line
+    if (!line.trim()) { flushList(); continue; }
+
+    // Regular paragraph
+    flushList();
+    elements.push(<p key={i} className="md-p">{renderInline(line)}</p>);
+  }
+  flushList();
+
+  return <div className="md-content">{elements}</div>;
+}
+
+function renderInline(text: string): React.ReactNode {
+  const parts: React.ReactNode[] = [];
+  // Process inline formatting: bold, italic, inline code, links
+  const inlineRegex = /(\*\*(.+?)\*\*|__(.+?)__|`([^`]+)`|\*(.+?)\*|_([^_]+)_|\[([^\]]+)\]\(([^)]+)\))/g;
+  let lastIdx = 0;
+  let inlineMatch: RegExpExecArray | null;
+
+  while ((inlineMatch = inlineRegex.exec(text)) !== null) {
+    if (inlineMatch.index > lastIdx) {
+      parts.push(text.slice(lastIdx, inlineMatch.index));
+    }
+    if (inlineMatch[2] || inlineMatch[3]) {
+      parts.push(<strong key={inlineMatch.index}>{inlineMatch[2] || inlineMatch[3]}</strong>);
+    } else if (inlineMatch[4]) {
+      parts.push(<code key={inlineMatch.index} className="md-inline-code">{inlineMatch[4]}</code>);
+    } else if (inlineMatch[5] || inlineMatch[6]) {
+      parts.push(<em key={inlineMatch.index}>{inlineMatch[5] || inlineMatch[6]}</em>);
+    } else if (inlineMatch[7] && inlineMatch[8]) {
+      parts.push(<a key={inlineMatch.index} href={inlineMatch[8]} target="_blank" rel="noopener noreferrer" className="md-link">{inlineMatch[7]}</a>);
+    }
+    lastIdx = inlineMatch.index + inlineMatch[0].length;
+  }
+  if (lastIdx < text.length) {
+    parts.push(text.slice(lastIdx));
+  }
+  return parts.length === 1 ? parts[0] : <>{parts}</>;
 }
 
 function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: ProjectArtifact }) {
@@ -2892,6 +3542,7 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
   const [editedFiles, setEditedFiles] = useState<Record<string, string>>({});
   const [editingPath, setEditingPath] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => {
     const initial = new Set<string>();
     for (const file of artifact.files) {
@@ -2951,7 +3602,12 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
     });
   }
 
-  function preview() {
+  function togglePreview() {
+    if (!previewHtml) return;
+    setShowPreview(!showPreview);
+  }
+
+  function openPreviewNewTab() {
     if (!previewHtml) return;
     const blob = new Blob([previewHtml], { type: "text/html" });
     const url = URL.createObjectURL(blob);
@@ -3032,17 +3688,27 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
             </button>
             <button
               type="button"
-              className="project-action-btn"
-              onClick={preview}
+              className={clsx("project-action-btn", showPreview && "active")}
+              onClick={togglePreview}
               disabled={!canPreview}
               title={
                 canPreview
-                  ? "Preview"
+                  ? (showPreview ? "Hide Preview" : "Preview")
                   : "Preview unavailable: this project has no browser HTML entry (likely backend/server-only)."
               }
             >
-              <Eye size={15} /> Preview
+              <Eye size={15} /> {showPreview ? "Code" : "Preview"}
             </button>
+            {canPreview && (
+              <button
+                type="button"
+                className="project-action-btn"
+                onClick={openPreviewNewTab}
+                title="Open in new tab"
+              >
+                <Rocket size={15} /> New Tab
+              </button>
+            )}
             <button type="button" className="project-action-btn primary" onClick={downloadZip}>
               <Download size={15} /> Download ZIP
             </button>
@@ -3053,6 +3719,16 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
             Preview unavailable for this artifact because it requires a server/runtime. Download the ZIP to run locally.
           </p>
         )}
+        {showPreview && previewHtml ? (
+          <div className="project-preview-panel">
+            <iframe
+              srcDoc={previewHtml}
+              title="Project Preview"
+              sandbox="allow-scripts allow-same-origin"
+              className="project-preview-iframe"
+            />
+          </div>
+        ) : (
         <div className="project-body">
           <aside className="project-tree">
             {fileTree.map((node) => renderTreeNode(node, 0))}
@@ -3075,7 +3751,7 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
                 {editingPath === activeFile.path ? (
                   <FileEditor content={activeContent} onSave={saveEdit} onCancel={() => setEditingPath(null)} />
                 ) : (
-                  <pre>{activeContent}</pre>
+                  <pre className="code-block-pre" dangerouslySetInnerHTML={{ __html: highlightCode(activeContent, getLanguageFromPath(activeFile?.path || "")) }} />
                 )}
               </>
             ) : (
@@ -3083,6 +3759,7 @@ function ProjectArtifactCard({ intro, artifact }: { intro: string; artifact: Pro
             )}
           </section>
         </div>
+        )}
       </div>
     </div>
   );
@@ -3605,11 +4282,13 @@ function TasksTab({
   stats,
   onOpenTaskInChat,
   onRetry,
+  onCancel,
 }: {
   tasks: Task[];
   stats: { total: number; completed: number; pendingExec: number; needApproval: number; rejected: number };
   onOpenTaskInChat?: (task: Task) => void;
   onRetry?: (task: Task) => void;
+  onCancel?: (task: Task) => void;
 }) {
   return (
     <section>
@@ -3659,20 +4338,24 @@ function TasksTab({
                 </td>
               </tr>
             )}
-            {tasks.map((task) => (
-              <tr
-                key={task.id}
-                className={task.conversationId ? "task-row-linked" : undefined}
-                tabIndex={task.conversationId ? 0 : undefined}
-                onClick={() => task.conversationId && onOpenTaskInChat?.(task)}
-                onKeyDown={(event) => {
-                  if (!task.conversationId || !onOpenTaskInChat) return;
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    onOpenTaskInChat(task);
-                  }
-                }}
-              >
+            {tasks.map((task) => {
+              const progress = taskProgress(task);
+              const inFlight = task.status === "QUEUED" || task.status === "RUNNING";
+              const retryable = task.status !== "PENDING_APPROVAL";
+              return (
+                <tr
+                  key={task.id}
+                  className={task.conversationId ? "task-row-linked" : undefined}
+                  tabIndex={task.conversationId ? 0 : undefined}
+                  onClick={() => task.conversationId && onOpenTaskInChat?.(task)}
+                  onKeyDown={(event) => {
+                    if (!task.conversationId || !onOpenTaskInChat) return;
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onOpenTaskInChat(task);
+                    }
+                  }}
+                >
                 <td>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <div className="agent-icon" style={{ width: 30, height: 30, fontSize: "0.7rem" }}>
@@ -3689,7 +4372,17 @@ function TasksTab({
                   <span className="fine-print">
                     {formatNumber(task.tokenCost)} tokens · {task.actionType}
                   </span>
-                  {(task.status === "FAILED" || task.status === "REJECTED") && task.result ? (
+                  {progress ? (
+                    <div className={clsx("task-progress", progress.tone === "slow" && "slow")}>
+                      <div className="task-progress-bar" aria-hidden>
+                        <span style={{ width: `${progress.percent}%` }} />
+                      </div>
+                      <span>
+                        {progress.label} · elapsed {formatElapsedTime(task.createdAt)}
+                      </span>
+                    </div>
+                  ) : null}
+                  {(task.status === "FAILED" || task.status === "REJECTED" || task.status === "COMPLETED") && task.result ? (
                     <span
                       className="fine-print task-fail-reason"
                       title={task.result}
@@ -3698,15 +4391,26 @@ function TasksTab({
                       {task.result.length > 280 ? `${task.result.slice(0, 280)}…` : task.result}
                     </span>
                   ) : null}
-                  {task.status === "FAILED" && onRetry && (
-                    <button
-                      type="button"
-                      className="task-retry-btn"
-                      onClick={(e) => { e.stopPropagation(); onRetry(task); }}
-                    >
-                      <RefreshCw size={13} /> Retry
-                    </button>
-                  )}
+                  <div className="task-action-row">
+                    {inFlight && onCancel && (
+                      <button
+                        type="button"
+                        className="task-retry-btn danger"
+                        onClick={(e) => { e.stopPropagation(); onCancel(task); }}
+                      >
+                        <X size={13} /> Cancel
+                      </button>
+                    )}
+                    {retryable && onRetry && (
+                      <button
+                        type="button"
+                        className="task-retry-btn"
+                        onClick={(e) => { e.stopPropagation(); onRetry(task); }}
+                      >
+                        <RefreshCw size={13} /> {inFlight ? "Restart" : "Retry"}
+                      </button>
+                    )}
+                  </div>
                 </td>
                 <td>
                   <span className={statusBadgeClass(task.status)}>{task.status.replaceAll("_", " ")}</span>
@@ -3718,7 +4422,8 @@ function TasksTab({
                   </span>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -3737,6 +4442,7 @@ function WorkspaceTab() {
   const [newFileName, setNewFileName] = useState("");
   const [newFileContent, setNewFileContent] = useState("");
   const [showNewFile, setShowNewFile] = useState(false);
+  const toast = useToast();
 
   useEffect(() => {
     loadFiles();
@@ -3749,45 +4455,78 @@ function WorkspaceTab() {
       if (res.ok) {
         const data = await res.json();
         setFiles(data.files ?? []);
+      } else {
+        toast.show({ tone: "danger", title: "Unable to load files", body: await readApiError(res) });
       }
+    } catch {
+      toast.show({ tone: "danger", title: "Could not load files", body: "Network error while loading workspace files." });
     } finally {
       setLoading(false);
     }
   }
 
   async function openFile(path: string) {
-    const res = await fetch("/api/workspace/read", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      setSelectedFile({ path: data.file.path, content: data.file.content });
+    try {
+      const res = await fetch("/api/workspace/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSelectedFile({ path: data.file.path, content: data.file.content });
+      } else {
+        if (selectedFile?.path === path) setSelectedFile(null);
+        toast.show({ tone: "danger", title: "Could not open file", body: await readApiError(res) });
+      }
+    } catch {
+      toast.show({ tone: "danger", title: "Could not open file", body: "Network error while opening the file." });
+      if (selectedFile?.path === path) setSelectedFile(null);
     }
   }
 
   async function createFile() {
-    if (!newFileName.trim()) return;
-    await fetch("/api/workspace", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: newFileName.trim(), content: newFileContent }),
-    });
-    setNewFileName("");
-    setNewFileContent("");
-    setShowNewFile(false);
-    await loadFiles();
+    const path = newFileName.trim();
+    if (!path) {
+      toast.show({ tone: "warning", title: "Missing path", body: "Please enter a file path before saving." });
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/workspace", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path, content: newFileContent }),
+      });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Could not create file", body: await readApiError(response) });
+        return;
+      }
+      setNewFileName("");
+      setNewFileContent("");
+      setShowNewFile(false);
+      await loadFiles();
+    } catch {
+      toast.show({ tone: "danger", title: "Could not create file", body: "Network error while saving the file." });
+    }
   }
 
   async function deleteFile(path: string) {
-    await fetch("/api/workspace", {
-      method: "DELETE",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    });
-    if (selectedFile?.path === path) setSelectedFile(null);
-    await loadFiles();
+    try {
+      const response = await fetch("/api/workspace", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path }),
+      });
+      if (!response.ok) {
+        toast.show({ tone: "danger", title: "Could not delete file", body: await readApiError(response) });
+        return;
+      }
+      if (selectedFile?.path === path) setSelectedFile(null);
+      await loadFiles();
+    } catch {
+      toast.show({ tone: "danger", title: "Could not delete file", body: "Network error while deleting the file." });
+    }
   }
 
   if (loading) return <div className="tab-empty-state"><p>Loading workspace…</p></div>;

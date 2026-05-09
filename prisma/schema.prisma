@@ -137,6 +137,8 @@ model Conversation {
   agentId           String?
   title             String
   opencodeSessionId String?
+  isAgentMode       Boolean     @default(true)
+  maxToolCalls      Int         @default(100)
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
   user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -156,12 +158,28 @@ model Message {
   content        String
   tokenEstimate  Int          @default(0)
   modelUsed      String?
+  toolCalls      ToolCall[]
   createdAt      DateTime     @default(now())
   user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
   @@index([conversationId])
   @@index([userId])
+}
+
+model ToolCall {
+  id            String   @id @default(cuid())
+  messageId     String
+  callId        String
+  name          String
+  arguments     String
+  result        String?
+  status        String   @default("COMPLETED")
+  tokenEstimate Int      @default(0)
+  createdAt     DateTime @default(now())
+  message       Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
 }
 
 model AgentTask {

@@ -6,7 +6,14 @@ type OpenCodeSession = {
 };
 
 type OpenCodeMessagePart =
-  | { type?: string; text?: string; content?: string; summary?: string }
+  | {
+      type?: string;
+      text?: string;
+      content?: string;
+      summary?: string;
+      image_url?: { url: string };
+      [key: string]: unknown;
+    }
   | Record<string, unknown>;
 
 type OpenCodeMessageResponse = {
@@ -133,6 +140,7 @@ export async function promptOpenCodeSession(
   timeoutOverrideMs?: number,
   maxTokens?: number,
   model?: { providerID: string; modelID: string },
+  parts?: OpenCodeMessagePart[],
 ) {
   const baseUrl = getOpenCodeBaseUrl();
 
@@ -149,7 +157,7 @@ export async function promptOpenCodeSession(
         system,
         max_tokens: maxTokens,
         model,
-        parts: [{ type: "text", text: prompt }],
+        parts: parts?.length ? parts : [{ type: "text", text: prompt }],
       }),
     },
     timeoutOverrideMs,

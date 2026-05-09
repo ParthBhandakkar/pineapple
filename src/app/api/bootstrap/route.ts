@@ -3,11 +3,13 @@ import { fail, ok } from "@/lib/http";
 import { prisma } from "@/lib/prisma";
 import { getActiveEntitlement, resetSubscriptionTokensIfNeeded } from "@/lib/tokens";
 import { isTestingUnlimited } from "@/lib/testing-unlimited";
+import { markStaleInFlightTasks } from "@/lib/task-monitor";
 
 export async function GET() {
   try {
     const user = await requireUser();
     await resetSubscriptionTokensIfNeeded(user.id);
+    await markStaleInFlightTasks(user.id);
 
     const [
       entitlement,
@@ -49,7 +51,7 @@ export async function GET() {
       prisma.userAgent.findMany({ where: { userId: user.id }, include: { agent: true } }),
       prisma.conversation.findMany({
         where: { userId: user.id },
-        include: { agent: true, messages: { orderBy: { createdAt: "asc" }, take: 200 } },
+        include: { agent: true, messages: { orderBy: { createdAt: "desc" }, take: 200 } },
         orderBy: { updatedAt: "desc" },
         take: 20,
       }),
@@ -82,6 +84,11 @@ export async function GET() {
       }),
     ]);
 
+    const normalizedConversations = conversations.map((conversation) => ({
+      ...conversation,
+      messages: [...conversation.messages].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+    }));
+
     return ok({
       testingUnlimited: isTestingUnlimited(),
       user: {
@@ -96,7 +103,7 @@ export async function GET() {
       tokenPacks,
       agents,
       userAgents,
-      conversations,
+      conversations: normalizedConversations,
       tasks,
       approvals,
       notifications,

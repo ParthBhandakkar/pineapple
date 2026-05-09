@@ -62,7 +62,7 @@ Set `COOKIE_SECURE="true"` when serving behind HTTPS.
 - Free tier: token-count based, default monthly allocation, one default deployed agent.
 - Subscriptions: Free, Basic, Professional, Business, Enterprise placeholders with editable admin limits.
 - Tokens: subscription tokens reset monthly; purchased tokens are separate and consumed after subscription balance.
-- Chat: OpenCode session first when configured; OpenRouter direct call when configured; local simulation fallback when no model key is set.
+- Chat: OpenCode-first/first-class runtime for all responses. OpenRouter remains as the upstream provider configured for OpenCode sessions.
 - Safety: only high-risk prompts pause for user approval.
 - Marketplace: browse agents, deploy according to plan limits, locked non-default agents on free plan.
 - Billing: Razorpay order creation and signature verification when keys are configured; mock completion otherwise.
@@ -70,9 +70,9 @@ Set `COOKIE_SECURE="true"` when serving behind HTTPS.
 
 ## Production Notes
 
-- Provision real OpenRouter credentials so OpenCode and direct chat calls can return live model output.
+- Provision real OpenRouter credentials so OpenCode can route to real upstream models.
 - Add real OpenRouter and Razorpay credentials.
 - Keep production secrets out of git (store them in an untracked `.env.production` on the VM or your secret manager).
 - Put the app behind HTTPS and set `COOKIE_SECURE="true"`.
-- If `FORCE_OPENCODE_ONLY="true"`, the health endpoint requires both database + OpenCode to be healthy.
+- The `/api/health` endpoint requires both database + OpenCode to be healthy for full functionality.
 - Add container/workspace isolation if the shared VM starts executing untrusted code, not just orchestrating sessions.

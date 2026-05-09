@@ -18,11 +18,11 @@ import { isTestingUnlimited } from "@/lib/testing-unlimited";
 export const maxDuration = 60;
 
 const chatSchema = z.object({
-  prompt: z.string().min(1).max(20000),
+  prompt: z.string().min(1).max(700_000),
   agentId: z.string().optional(),
   conversationId: z.string().optional(),
   modelCode: z.string().optional(),
-  images: z.array(z.string().max(10_000_000)).max(5).optional(),
+  images: z.array(z.string().max(30_000_000)).max(5).optional(),
   silent: z.boolean().optional(),
 });
 
@@ -32,7 +32,7 @@ export async function POST(request: Request) {
     const body = chatSchema.parse(await request.json());
 
     if (body.images?.length) {
-      console.log(`[chat] received ${body.images.length} image(s), first ${body.images[0].slice(0, 40)}...`);
+      console.log(`[chat] received ${body.images.length} attachment(s), first ${body.images[0].slice(0, 40)}...`);
     }
 
     const entitlement = await getActiveEntitlement(user.id);

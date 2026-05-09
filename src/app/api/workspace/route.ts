@@ -5,6 +5,22 @@ import { prisma } from "@/lib/prisma";
 
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB per file
 const MAX_FILES_PER_USER = 200;
+const MAX_WORKSPACE_PATH_LENGTH = 500;
+
+function normalizeWorkspacePath(raw: string) {
+  const trimmed = raw.trim();
+  if (!trimmed) throw new HttpError(400, "File path cannot be empty.");
+
+  const normalized = trimmed.replace(/^\/+/, "").replace(/\\/g, "/").replace(/\/+/g, "/");
+
+  if (normalized.length > MAX_WORKSPACE_PATH_LENGTH) {
+    throw new HttpError(400, `File path exceeds maximum length of ${MAX_WORKSPACE_PATH_LENGTH} characters.`);
+  }
+  if (normalized === "." || normalized === ".." || normalized.startsWith("../") || normalized.includes("/../")) {
+    throw new HttpError(400, "Invalid file path.");
+  }
+  return normalized;
+}
 
 const createFileSchema = z.object({
   path: z.string().min(1).max(500),
@@ -42,6 +58,7 @@ export async function POST(request: Request) {
   try {
     const user = await requireUser();
     const body = createFileSchema.parse(await request.json());
+    const path = normalizeWorkspacePath(body.path);
 
     const fileCount = await prisma.userFile.count({ where: { userId: user.id } });
     if (fileCount >= MAX_FILES_PER_USER) {
@@ -49,7 +66,7 @@ export async function POST(request: Request) {
     }
 
     const existing = await prisma.userFile.findUnique({
-      where: { userId_path: { userId: user.id, path: body.path } },
+      where: { userId_path: { userId: user.id, path } },
     });
 
     if (existing) {
@@ -67,7 +84,7 @@ export async function POST(request: Request) {
     const file = await prisma.userFile.create({
       data: {
         userId: user.id,
-        path: body.path,
+        path,
         content: body.content,
         mimeType: body.mimeType ?? "text/plain",
         sizeBytes: Buffer.byteLength(body.content, "utf-8"),
@@ -84,9 +101,11 @@ export async function PATCH(request: Request) {
   try {
     const user = await requireUser();
     const body = updateFileSchema.parse(await request.json());
+    const path = normalizeWorkspacePath(body.path);
+    const nextPath = body.newPath ? normalizeWorkspacePath(body.newPath) : null;
 
     const file = await prisma.userFile.findUnique({
-      where: { userId_path: { userId: user.id, path: body.path } },
+      where: { userId_path: { userId: user.id, path } },
     });
 
     if (!file) throw new HttpError(404, "File not found");
@@ -96,8 +115,16 @@ export async function PATCH(request: Request) {
       data.content = body.content;
       data.sizeBytes = Buffer.byteLength(body.content, "utf-8");
     }
-    if (body.newPath) {
-      data.path = body.newPath;
+    if (body.newPath && nextPath) {
+      if (nextPath !== path) {
+        const existingTarget = await prisma.userFile.findUnique({
+          where: { userId_path: { userId: user.id, path: nextPath } },
+        });
+        if (existingTarget) {
+          throw new HttpError(409, "A file already exists at the new path.");
+        }
+      }
+      data.path = nextPath;
     }
 
     const updated = await prisma.userFile.update({
@@ -115,9 +142,10 @@ export async function DELETE(request: Request) {
   try {
     const user = await requireUser();
     const body = deleteFileSchema.parse(await request.json());
+    const path = normalizeWorkspacePath(body.path);
 
     const file = await prisma.userFile.findUnique({
-      where: { userId_path: { userId: user.id, path: body.path } },
+      where: { userId_path: { userId: user.id, path } },
     });
 
     if (!file) throw new HttpError(404, "File not found");

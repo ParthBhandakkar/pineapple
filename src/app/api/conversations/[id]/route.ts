@@ -11,6 +11,35 @@ type RouteContext = {
   params: Promise<{ id: string }>;
 };
 
+function normalizeConversationMessages(conversation: { messages: { id: string; userId: string; conversationId: string; role: string; content: string; tokenEstimate: number; modelUsed: string | null; createdAt: Date; }[] }) {
+  return {
+    ...conversation,
+    messages: [...conversation.messages].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+  };
+}
+
+export async function GET(_request: Request, context: RouteContext) {
+  try {
+    const user = await requireUser();
+    const { id } = await context.params;
+
+    const conversation = await prisma.conversation.findFirst({
+      where: { id, userId: user.id },
+      include: { agent: true, messages: { orderBy: { createdAt: "desc" }, take: 200 } },
+    });
+
+    if (!conversation) {
+      throw new HttpError(404, "Conversation not found");
+    }
+
+    return ok({
+      conversation: normalizeConversationMessages(conversation),
+    });
+  } catch (error) {
+    return fail(error);
+  }
+}
+
 export async function PATCH(request: Request, context: RouteContext) {
   try {
     const user = await requireUser();

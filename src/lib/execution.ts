@@ -6,12 +6,23 @@ import { createOpenCodeSession } from "@/lib/opencode";
 import { getBillingModel } from "@/lib/models";
 import { logError } from "@/lib/error-logger";
 
+const TASK_EXECUTION_TIMEOUT_MS = Number(process.env.TASK_EXECUTION_TIMEOUT_MS ?? "720000");
+
 type ExecuteTaskInput = {
   taskId: string;
   approved?: boolean;
   billingModelCode?: string | null;
   images?: string[];
 };
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, reason: string): Promise<T> {
+  return await Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(reason)), timeoutMs);
+    }),
+  ]);
+}
 
 export async function executeTask(input: ExecuteTaskInput) {
   const task = await prisma.agentTask.findUniqueOrThrow({
@@ -23,10 +34,14 @@ export async function executeTask(input: ExecuteTaskInput) {
     },
   });
 
-  await prisma.agentTask.update({
-    where: { id: task.id },
+  const started = await prisma.agentTask.updateMany({
+    where: { id: task.id, status: { in: ["QUEUED", "PENDING_APPROVAL"] } },
     data: { status: "RUNNING" },
   });
+
+  if (started.count === 0) {
+    return await prisma.agentTask.findUniqueOrThrow({ where: { id: task.id } });
+  }
 
   if (task.conversation && task.conversation.userId !== task.userId) {
     await prisma.agentTask.update({
@@ -68,24 +83,43 @@ export async function executeTask(input: ExecuteTaskInput) {
 
   let generated: Awaited<ReturnType<typeof generateAgentResponse>>;
 
-  const useOpenCodeOnly = process.env.FORCE_OPENCODE_ONLY === "true";
-
   try {
-    generated = await generateAgentResponse({
-      userId: task.userId,
-      prompt: task.prompt,
-      agentName: task.agent?.name ?? "Code Pilot",
-      conversationId: conversation.id,
-      opencodeSessionId: conversation.opencodeSessionId,
-      billingModelCode: selectedModel.code,
-      images: input.images,
-    });
+    generated = await withTimeout(
+      generateAgentResponse({
+        userId: task.userId,
+        prompt: task.prompt,
+        agentName: task.agent?.name ?? "Code Pilot",
+        conversationId: conversation.id,
+        opencodeSessionId: conversation.opencodeSessionId,
+        billingModelCode: selectedModel.code,
+        images: input.images,
+      }),
+      TASK_EXECUTION_TIMEOUT_MS,
+      `Task execution exceeded ${TASK_EXECUTION_TIMEOUT_MS}ms`,
+    );
   } catch (error) {
     logError("Model generation failed", error, { taskId: task.id, userId: task.userId });
 
+    const latestTaskState = await prisma.agentTask.findUnique({
+      where: { id: task.id },
+    });
+
+    if (latestTaskState && latestTaskState.status !== "RUNNING") {
+      await writeLog({
+        userId: task.userId,
+        taskId: task.id,
+        level: "WARN",
+        event: "task.execution.superseded",
+        summary: `Task failure was discarded because the task is already ${latestTaskState.status}.`,
+        metadata: { currentStatus: latestTaskState.status, currentResult: latestTaskState.result ?? null },
+      });
+      return latestTaskState;
+    }
+
     const message =
-      error instanceof Error && error.name === "AbortError"
-        ? "The model request timed out. Try again, or set MODEL_REQUEST_TIMEOUT_MS higher on the server."
+      error instanceof Error &&
+      (error.name === "AbortError" || /timed out|timeout|exceeded/i.test(error.message))
+        ? "The model request timed out. Please retry. We have automatically stopped this run to avoid getting stuck."
         : error instanceof Error
           ? error.message
           : "Failed to generate response from model service";
@@ -97,6 +131,22 @@ export async function executeTask(input: ExecuteTaskInput) {
       },
     });
     throw error;
+  }
+
+  const latestTaskState = await prisma.agentTask.findUnique({
+    where: { id: task.id },
+  });
+
+  if (latestTaskState && latestTaskState.status !== "RUNNING") {
+    await writeLog({
+      userId: task.userId,
+      taskId: task.id,
+      level: "WARN",
+      event: "task.execution.superseded",
+      summary: `Task result was discarded because the task is already ${latestTaskState.status}.`,
+      metadata: { currentStatus: latestTaskState.status, currentResult: latestTaskState.result ?? null },
+    });
+    return latestTaskState;
   }
 
   const usageTokens = generated.totalTokens ?? estimatedBaseTokens;
@@ -126,26 +176,75 @@ export async function executeTask(input: ExecuteTaskInput) {
     throw error;
   }
 
-  await prisma.message.create({
-    data: {
-      userId: task.userId,
-      conversationId: conversation.id,
-      role: "USER",
-      content: task.prompt,
-      tokenEstimate: Math.ceil(task.prompt.length / 4),
-    },
-  });
+  let updated;
+  try {
+    const conversationRecord = await prisma.conversation.findFirst({
+      where: { id: conversation.id, userId: task.userId },
+    });
+    if (!conversationRecord) {
+      conversation = await prisma.conversation.create({
+        data: {
+          userId: task.userId,
+          agentId: task.agentId,
+          title: task.prompt.slice(0, 72) || "New session",
+          opencodeSessionId: conversation.opencodeSessionId ?? null,
+        },
+      });
+    } else {
+      conversation = conversationRecord;
+    }
 
-  await prisma.message.create({
-    data: {
-      userId: task.userId,
-      conversationId: conversation.id,
-      role: "ASSISTANT",
-      content: assistantContent,
-      tokenEstimate: tokenCost,
-      modelUsed: generated.model ?? selectedModel.openRouterModel ?? selectedModel.code,
-    },
-  });
+    updated = await prisma.$transaction(async (tx) => {
+      await tx.message.create({
+        data: {
+          userId: task.userId,
+          conversationId: conversation.id,
+          role: "USER",
+          content: task.prompt,
+          tokenEstimate: Math.ceil(task.prompt.length / 4),
+        },
+      });
+
+      await tx.message.create({
+        data: {
+          userId: task.userId,
+          conversationId: conversation.id,
+          role: "ASSISTANT",
+          content: assistantContent,
+          tokenEstimate: tokenCost,
+          modelUsed: generated.model ?? selectedModel.openRouterModel ?? selectedModel.code,
+        },
+      });
+
+      await tx.conversation.update({
+        where: { id: conversation.id },
+        data: { updatedAt: new Date() },
+      });
+
+      return await tx.agentTask.update({
+        where: { id: task.id },
+        data: {
+          status: "COMPLETED",
+          conversationId: conversation.id,
+          result: assistantContent,
+          tokenCost,
+        },
+      });
+    });
+  } catch (error) {
+    logError("Task persistence failed", error, { taskId: task.id, userId: task.userId, conversationId: conversation.id });
+    await prisma.agentTask.update({
+      where: { id: task.id },
+      data: {
+        status: "FAILED",
+        result:
+          error instanceof Error
+            ? `Task failed while saving results: ${error.message}`
+            : "Task failed while saving results.",
+      },
+    });
+    throw error;
+  }
 
   // Auto-save project artifact files to user's workspace
   try {
@@ -163,34 +262,36 @@ export async function executeTask(input: ExecuteTaskInput) {
       }
       if (artifact?.files?.length) {
         for (const file of artifact.files) {
-          if (file.path && file.content) {
-            await prisma.userFile.upsert({
-              where: { userId_path: { userId: task.userId, path: file.path } },
-              update: { content: file.content, sizeBytes: Buffer.byteLength(file.content, "utf-8") },
-              create: {
-                userId: task.userId,
-                path: file.path,
-                content: file.content,
-                sizeBytes: Buffer.byteLength(file.content, "utf-8"),
-              },
-            });
+          const normalizedPath = typeof file.path === "string"
+            ? file.path
+                .trim()
+                .replace(/^\/+/, "")
+                .replace(/\\/g, "/")
+                .replace(/\/+/g, "/")
+            : "";
+          const normalizedContent = typeof file.content === "string" ? file.content : "";
+
+          if (!normalizedPath) continue;
+          if (normalizedPath === "." || normalizedPath === ".." || normalizedPath.startsWith("../") || normalizedPath.includes("/../")) {
+            continue;
           }
+
+          await prisma.userFile.upsert({
+            where: { userId_path: { userId: task.userId, path: normalizedPath } },
+            update: { content: normalizedContent, sizeBytes: Buffer.byteLength(normalizedContent, "utf-8") },
+            create: {
+              userId: task.userId,
+              path: normalizedPath,
+              content: normalizedContent,
+              sizeBytes: Buffer.byteLength(normalizedContent, "utf-8"),
+            },
+          });
         }
       }
     }
   } catch {
     // Non-critical — don't fail the task if workspace save fails
   }
-
-  const updated = await prisma.agentTask.update({
-    where: { id: task.id },
-    data: {
-      status: "COMPLETED",
-      conversationId: conversation.id,
-      result: assistantContent,
-      tokenCost,
-    },
-  });
 
   await prisma.notification.create({
     data: {
@@ -210,7 +311,7 @@ export async function executeTask(input: ExecuteTaskInput) {
       model: generated.model ?? selectedModel.code,
       fallbackNotice: generated.fallbackNotice ?? null,
       provider:
-        useOpenCodeOnly && input.billingModelCode ? "opencode" : input.billingModelCode ? "opencode_or_openrouter" : "openrouter",
+        "opencode",
     },
   });
 
