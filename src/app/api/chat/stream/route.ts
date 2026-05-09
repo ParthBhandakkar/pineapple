@@ -116,10 +116,21 @@ export async function POST(request: Request) {
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
+        let controllerClosed = false;
         const send = (event: string, data: unknown) => {
-          const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-          controller.enqueue(encoder.encode(line));
+          if (controllerClosed || abortController.signal.aborted) return;
+          try {
+            const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+            controller.enqueue(encoder.encode(line));
+          } catch {
+            controllerClosed = true;
+          }
         };
+
+        // Send periodic heartbeats to prevent proxy/client timeout during long AI processing
+        const heartbeat = setInterval(() => {
+          send("heartbeat", { ts: Date.now() });
+        }, 15_000);
 
         try {
           send("status", { status: "starting", message: "Agent starting..." });
@@ -258,7 +269,11 @@ export async function POST(request: Request) {
           }
           logError("Stream error", error, { taskId: task.id });
         } finally {
-          controller.close();
+          clearInterval(heartbeat);
+          if (!controllerClosed) {
+            try { controller.close(); } catch { /* already closed */ }
+          }
+          controllerClosed = true;
         }
       },
     });
