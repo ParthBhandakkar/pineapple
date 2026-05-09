@@ -33,7 +33,21 @@ const highRiskPatterns = [
   },
 ];
 
+const codingContextPattern = /\b(create|build|make|generate|code|develop|design|implement|write|craft|scaffold|construct|setup|set up|give me|i want|i need|want to|please make|program|app|website|page|component|function|class|module|api|endpoint|route|handler|script|tool|game|clone|widget|template|example|demo|sample|tutorial|show me|how to)\b/i;
+
 export function classifyRisk(prompt: string): RiskClassification {
+  // If the prompt is clearly a coding/project generation request,
+  // skip high-risk classification since the keywords (delete, server, deploy, etc.)
+  // are being used in a code-authoring context, not as real destructive commands.
+  if (codingContextPattern.test(prompt)) {
+    return {
+      isHighRisk: false,
+      riskLevel: "LOW",
+      actionType: "NORMAL",
+      reason: "Coding/project generation request — risk keywords are contextual.",
+    };
+  }
+
   for (const item of highRiskPatterns) {
     if (item.pattern.test(prompt)) {
       return {
