@@ -1648,10 +1648,23 @@ function DashboardInner() {
 
           // Final update and refresh data
           await loadData();
+          // Messages are now in DB — clear pending to avoid duplicates
+          setPendingMessagesByConversation((current) => {
+            const next = { ...current };
+            delete next[activeConversationId];
+            return next;
+          });
         } catch (error) {
           if (error instanceof Error && error.name !== "AbortError") {
             toast.show({ tone: "danger", title: "Stream error", body: error.message });
           }
+          // User message + error are now saved in DB — refresh and clear pending
+          await loadData();
+          setPendingMessagesByConversation((current) => {
+            const next = { ...current };
+            delete next[activeConversationId];
+            return next;
+          });
         }
       };
 
@@ -1662,6 +1675,15 @@ function DashboardInner() {
         body: "Your message is being processed. Reply will appear here when ready.",
       });
       await loadData();
+      // User message is now persisted in DB and returned by loadData().
+      // Remove the pending user message to avoid duplication, keep only the streaming assistant.
+      setPendingMessagesByConversation((current) => {
+        const convPending = current[activeConversationId];
+        if (!convPending || convPending.length === 0) return current;
+        const assistantOnly = convPending.filter((m) => m.role === "ASSISTANT");
+        if (assistantOnly.length === convPending.length) return current;
+        return { ...current, [activeConversationId]: assistantOnly };
+      });
     } catch (error) {
       const message =
         error instanceof Error

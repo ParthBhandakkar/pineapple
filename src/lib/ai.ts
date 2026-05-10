@@ -62,8 +62,8 @@ const MAX_CONVERSATION_HISTORY = 40;
 const CONTEXT_HISTORY_MESSAGES = 20;
 const CODING_TIMEOUT_MS = 300_000;
 const NON_CODING_TIMEOUT_MS = 240_000;
-const OPENCODE_PRIMARY_TIMEOUT_MS = 240_000;
-const OPENCODE_RETRY_TIMEOUT_MS = 180_000;
+const OPENCODE_PRIMARY_TIMEOUT_MS = 360_000;
+const OPENCODE_RETRY_TIMEOUT_MS = 240_000;
 const CODING_MAX_TOKENS = 16000;
 const NON_CODING_MAX_TOKENS = 4096;
 const REPAIR_MAX_TOKENS = 16000;
@@ -1011,7 +1011,10 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
     providerID: "openrouter",
     modelID: OPENCODE_SAFE_MODEL,
   };
-  const openCodePrimaryModel = OPENCODE_PREFER_SAFE_MODEL ? openCodeSafeModel : openCodeSelectedModel;
+  // Let OpenCode use its own configured default model (OPENCODE_MODEL env var).
+  // Passing a model override can fail if the OpenRouter account's privacy/guardrail
+  // settings don't allow that specific model. The UI model selection is for billing only.
+  const openCodePrimaryModel: { providerID: string; modelID: string } | null = null;
 
   async function callOpenCode(
     prompt: string,
@@ -1077,7 +1080,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         `${fullSystem}\n\nKeep response concise and deterministic.`,
         OPENCODE_RETRY_TIMEOUT_MS,
         codingProjectRequest ? CODING_MAX_TOKENS : 900,
-        openCodeSafeModel,
+        null,
         buildOpenCodeMessageParts(input.prompt, input.images),
       );
     }
@@ -1110,7 +1113,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
         fullSystem,
         OPENCODE_RETRY_TIMEOUT_MS,
         REPAIR_MAX_TOKENS,
-        openCodeSafeModel,
+        null,
         [{ type: "text", text: repairPrompt }],
       );
     }
@@ -1123,6 +1126,7 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
       return {
         ...openCodeResult,
         content: normalizedContent,
+        model: selectedModel.openRouterModel,
         selectedModelCode: selectedModel.code,
         selectedModelMultiplier: selectedModel.multiplier,
       };
@@ -1138,13 +1142,14 @@ export async function generateAgentResponse(input: GenerateInput): Promise<Gener
           `${baseSystem}\n\nPrioritize completing the request even if model routing is constrained.`,
           OPENCODE_RETRY_TIMEOUT_MS,
           codingProjectRequest ? CODING_MAX_TOKENS : 900,
-          openCodeSafeModel,
+          null,
           buildOpenCodeMessageParts(input.prompt, input.images),
         );
         if (directOpenCodeResult?.content?.trim()) {
           return {
             ...directOpenCodeResult,
             content: normalizeProjectArtifactContent(directOpenCodeResult.content, codingProjectRequest),
+            model: selectedModel.openRouterModel,
             selectedModelCode: selectedModel.code,
             selectedModelMultiplier: selectedModel.multiplier,
           };

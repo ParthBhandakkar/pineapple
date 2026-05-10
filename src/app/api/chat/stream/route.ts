@@ -135,6 +135,17 @@ export async function POST(request: Request) {
         try {
           send("status", { status: "starting", message: "Agent starting..." });
 
+          // Persist user message BEFORE running agent loop so it survives timeouts/errors
+          await prisma.message.create({
+            data: {
+              userId: user.id,
+              conversationId,
+              role: "USER",
+              content: body.prompt,
+              tokenEstimate: Math.ceil(body.prompt.length / 4),
+            },
+          });
+
           const toolCalls: Array<{
             callId: string;
             name: string;
@@ -191,19 +202,9 @@ export async function POST(request: Request) {
             },
           });
 
-          // Save messages to DB after completion
+          // Save assistant response to DB after completion
           try {
             const tokenCost = Math.max(1, Math.ceil(result.totalTokens * selectedModel.multiplier));
-
-            await prisma.message.create({
-              data: {
-                userId: user.id,
-                conversationId,
-                role: "USER",
-                content: body.prompt,
-                tokenEstimate: Math.ceil(body.prompt.length / 4),
-              },
-            });
 
             if (result.content) {
               await prisma.message.create({
@@ -262,6 +263,20 @@ export async function POST(request: Request) {
           send("error", { message: errorMessage });
 
           if (!(error instanceof Error && error.name === "AbortError")) {
+            // Persist the error as an assistant message so the user can see it in chat history
+            try {
+              await prisma.message.create({
+                data: {
+                  userId: user.id,
+                  conversationId,
+                  role: "ASSISTANT",
+                  content: errorMessage,
+                  tokenEstimate: 0,
+                  modelUsed: selectedModel.openRouterModel,
+                },
+              });
+            } catch { /* best-effort */ }
+
             await prisma.agentTask.update({
               where: { id: task.id },
               data: { status: "FAILED", result: errorMessage },
